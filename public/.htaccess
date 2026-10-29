@@ -1,0 +1,11 @@
+RewriteEngine On
+RewriteBase /
+
+# Serve real files and directories (including the pre-rendered
+# /services/<slug>/index.html etc. pages) as-is.
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^ - [L]
+
+# Everything else falls back to the SPA shell so client-side routing works.
+RewriteRule ^ index.html [L]
