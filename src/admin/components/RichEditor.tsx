@@ -10,10 +10,13 @@ import {
   Quote,
   Code,
   Link as LinkIcon,
+  Image as ImageIcon,
   Eye,
   Edit3,
   Code2,
+  RefreshCw,
 } from 'lucide-react';
+import { uploadMediaToStorage } from '../../lib/storageService';
 
 interface RichEditorProps {
   value: string;
@@ -29,7 +32,9 @@ export const RichEditor: React.FC<RichEditorProps> = ({
   placeholder = 'Write blog content here...',
 }) => {
   const [viewMode, setViewMode] = useState<'edit' | 'preview' | 'html'>('edit');
+  const [uploadingImage, setUploadingImage] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const imageInputRef = useRef<HTMLInputElement>(null);
 
   const insertTag = (prefix: string, suffix: string = '') => {
     const el = textareaRef.current;
@@ -57,6 +62,22 @@ export const RichEditor: React.FC<RichEditorProps> = ({
     const url = prompt('Enter link URL (e.g. https://...):', 'https://');
     if (url) {
       insertTag(`<a href="${url}" target="_blank" rel="noopener noreferrer">`, '</a>');
+    }
+  };
+
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setUploadingImage(true);
+    try {
+      const result = await uploadMediaToStorage(file, { folder: 'blogs' });
+      insertTag(`\n<img src="${result.url}" alt="${file.name.replace(/\.[^/.]+$/, '')}" class="rounded-2xl my-6 w-full object-cover" />\n`, '');
+    } catch (err: any) {
+      alert(`Image upload failed: ${err?.message || err}`);
+    } finally {
+      setUploadingImage(false);
+      if (imageInputRef.current) imageInputRef.current.value = '';
     }
   };
 
@@ -195,6 +216,28 @@ export const RichEditor: React.FC<RichEditorProps> = ({
               title="Insert Link"
             >
               <LinkIcon className="h-4 w-4" />
+            </button>
+
+            {/* Cloud Image Upload */}
+            <input
+              ref={imageInputRef}
+              type="file"
+              accept="image/jpeg,image/png,image/webp,image/gif,image/svg+xml"
+              onChange={handleImageUpload}
+              className="hidden"
+            />
+            <button
+              type="button"
+              disabled={uploadingImage}
+              onClick={() => imageInputRef.current?.click()}
+              className="rounded-lg p-1.5 hover:bg-white/10 hover:text-app transition-colors disabled:opacity-50"
+              title="Upload & Insert Cloud Image (WebP Optimized)"
+            >
+              {uploadingImage ? (
+                <RefreshCw className="h-4 w-4 animate-spin text-[color:var(--color-brand-blue)]" />
+              ) : (
+                <ImageIcon className="h-4 w-4" />
+              )}
             </button>
 
             <div className="ml-auto text-[11px] text-dim pr-1">

@@ -1,12 +1,24 @@
 import { useState, useEffect, useCallback } from 'react';
 import type { AdminDatabase } from '../types';
 import { getInitialSeedData } from './seed';
+import {
+  fetchCollectionFromSupabase,
+  createItemInSupabase,
+  updateItemInSupabase,
+  deleteItemInSupabase,
+  reorderItemsInSupabase,
+  toggleItemStatusInSupabase,
+  fetchDashboardCountsRPC,
+  CollectionKey,
+} from './supabaseService';
+
+export { fetchDashboardCountsRPC };
 
 const STORAGE_KEY = 'primexpixel_admin_db_v2';
 const OLD_STORAGE_KEY = 'primexpixel_admin_db_v1';
 const DB_UPDATE_EVENT = 'primexpixel_db_updated';
 
-// In-memory cache for fast synchronous access
+// In-memory cache for fast synchronous access and backwards compatibility
 let cachedDB: AdminDatabase | null = null;
 
 export function getAdminDB(): AdminDatabase {
@@ -17,39 +29,14 @@ export function getAdminDB(): AdminDatabase {
     if (raw) {
       const parsed = JSON.parse(raw);
       if (parsed && parsed.version && parsed.blogs && parsed.services) {
-        if (Array.isArray(parsed.reviews)) {
-          const originalLen = parsed.reviews.length;
-          parsed.reviews = parsed.reviews.filter((r: any) =>
-            !(
-              (r.name === 'denil' && r.company === 'denil') ||
-              (typeof r.reviewText === 'string' && r.reviewText.includes('kdfuhy'))
-            )
-          );
-          if (parsed.reviews.length !== originalLen) {
-            // Re-index order
-            parsed.reviews.forEach((r: any, idx: number) => {
-              r.order = idx + 1;
-            });
-            saveAdminDB(parsed);
-          }
-        }
         cachedDB = parsed;
         return parsed;
       }
     }
 
-    // Seamless migration from v1: preserve user data while updating zero-pricing services
     const oldRaw = localStorage.getItem(OLD_STORAGE_KEY);
     if (oldRaw) {
       const oldParsed = JSON.parse(oldRaw);
-      if (Array.isArray(oldParsed.reviews)) {
-        oldParsed.reviews = oldParsed.reviews.filter((r: any) =>
-          !(
-            (r.name === 'denil' && r.company === 'denil') ||
-            (typeof r.reviewText === 'string' && r.reviewText.includes('kdfuhy'))
-          )
-        );
-      }
       const seed = getInitialSeedData();
       const migrated: AdminDatabase = {
         ...seed,
@@ -87,112 +74,6 @@ export function getCollection<K extends keyof Omit<AdminDatabase, 'version' | 'l
   return (db[collection] || []) as AdminDatabase[K];
 }
 
-export function createItem<K extends keyof Omit<AdminDatabase, 'version' | 'lastUpdated'>>(
-  collection: K,
-  item: any
-): any {
-  const db = getAdminDB();
-  const list = [...((db[collection] as any[]) || [])];
-  
-  const newItem = {
-    ...item,
-    id: item.id || `${collection}-${Date.now()}-${Math.random().toString(36).substring(2, 7)}`,
-    order: item.order !== undefined ? item.order : list.length + 1,
-    updatedAt: new Date().toISOString(),
-  };
-
-  list.push(newItem);
-  db[collection] = list as any;
-  saveAdminDB(db);
-  return newItem;
-}
-
-export function updateItem<K extends keyof Omit<AdminDatabase, 'version' | 'lastUpdated'>>(
-  collection: K,
-  id: string,
-  updates: any
-): any {
-  const db = getAdminDB();
-  const list = [...((db[collection] as any[]) || [])];
-  const index = list.findIndex((x) => x.id === id);
-
-  if (index === -1) {
-    throw new Error(`Item with id ${id} not found in ${collection}`);
-  }
-
-  const updatedItem = {
-    ...list[index],
-    ...updates,
-    updatedAt: new Date().toISOString(),
-  };
-
-  list[index] = updatedItem;
-  db[collection] = list as any;
-  saveAdminDB(db);
-  return updatedItem;
-}
-
-export function deleteItem<K extends keyof Omit<AdminDatabase, 'version' | 'lastUpdated'>>(
-  collection: K,
-  id: string
-): void {
-  const db = getAdminDB();
-  const list = ((db[collection] as any[]) || []).filter((x) => x.id !== id);
-  // Re-index orders
-  list.forEach((item, idx) => {
-    item.order = idx + 1;
-  });
-  db[collection] = list as any;
-  saveAdminDB(db);
-}
-
-export function reorderCollection<K extends keyof Omit<AdminDatabase, 'version' | 'lastUpdated'>>(
-  collection: K,
-  orderedIds: string[]
-): void {
-  const db = getAdminDB();
-  const list = ((db[collection] as any[]) || []);
-  const map = new Map(list.map((item) => [item.id, item]));
-
-  const reordered: any[] = [];
-  orderedIds.forEach((id, idx) => {
-    const item = map.get(id);
-    if (item) {
-      item.order = idx + 1;
-      item.updatedAt = new Date().toISOString();
-      reordered.push(item);
-      map.delete(id);
-    }
-  });
-
-  // Append any remaining that weren't in orderedIds
-  map.forEach((item) => {
-    item.order = reordered.length + 1;
-    reordered.push(item);
-  });
-
-  db[collection] = reordered as any;
-  saveAdminDB(db);
-}
-
-export function toggleItemStatus<K extends keyof Omit<AdminDatabase, 'version' | 'lastUpdated'>>(
-  collection: K,
-  id: string
-): void {
-  const db = getAdminDB();
-  const list = ((db[collection] as any[]) || []);
-  const item = list.find((x) => x.id === id);
-  if (!item) return;
-
-  if ('status' in item) {
-    item.status = item.status === 'published' ? 'draft' : 'published';
-  } else if ('show' in item) {
-    item.show = !item.show;
-  }
-  item.updatedAt = new Date().toISOString();
-  saveAdminDB(db);
-}
-
 export function exportDatabaseJSON(): string {
   const db = getAdminDB();
   return JSON.stringify(db, null, 2);
@@ -218,39 +99,134 @@ export function resetDatabaseToDefaults(): AdminDatabase {
   return initial;
 }
 
-// React hook to subscribe to collection updates
-export function useAdminCollection<K extends keyof Omit<AdminDatabase, 'version' | 'lastUpdated'>>(
-  collection: K
-) {
-  const [data, setData] = useState<AdminDatabase[K]>(() => getCollection(collection));
+// ============================================================================
+// REACT HOOK: Directly connected to Supabase PostgreSQL Database
+// ============================================================================
 
-  const refresh = useCallback(() => {
-    setData(getCollection(collection));
+export function useAdminCollection<K extends CollectionKey>(collection: K) {
+  const [data, setData] = useState<any[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchItems = useCallback(async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      const remoteItems = await fetchCollectionFromSupabase(collection);
+      setData(remoteItems);
+    } catch (err: any) {
+      console.warn(`[Supabase] Could not fetch remote ${collection}, falling back to local cache:`, err?.message);
+      setError(err?.message || 'Error fetching data');
+      // Graceful fallback to cached data if network issue occurs
+      const local = getCollection(collection as any);
+      setData(local || []);
+    } finally {
+      setLoading(false);
+    }
   }, [collection]);
 
   useEffect(() => {
-    refresh();
+    fetchItems();
 
     const handleUpdate = () => {
-      refresh();
+      fetchItems();
     };
 
     window.addEventListener(DB_UPDATE_EVENT, handleUpdate);
-    window.addEventListener('storage', handleUpdate);
 
     return () => {
       window.removeEventListener(DB_UPDATE_EVENT, handleUpdate);
-      window.removeEventListener('storage', handleUpdate);
     };
-  }, [collection, refresh]);
+  }, [collection, fetchItems]);
+
+  // Create item in Supabase
+  const create = async (item: any): Promise<any> => {
+    try {
+      const newItem = await createItemInSupabase(collection, item);
+      setData((prev) => [...prev, newItem]);
+      window.dispatchEvent(new CustomEvent(DB_UPDATE_EVENT, { detail: { timestamp: Date.now() } }));
+      return newItem;
+    } catch (err: any) {
+      console.error(`[Supabase] Error creating item in ${collection}:`, err);
+      throw err;
+    }
+  };
+
+  // Update item in Supabase
+  const update = async (id: string, updates: any): Promise<any> => {
+    try {
+      const updatedItem = await updateItemInSupabase(collection, id, updates);
+      setData((prev) => prev.map((x) => (x.id === id ? { ...x, ...updatedItem } : x)));
+      window.dispatchEvent(new CustomEvent(DB_UPDATE_EVENT, { detail: { timestamp: Date.now() } }));
+      return updatedItem;
+    } catch (err: any) {
+      console.error(`[Supabase] Error updating item ${id} in ${collection}:`, err);
+      throw err;
+    }
+  };
+
+  // Delete item from Supabase
+  const remove = async (id: string): Promise<void> => {
+    try {
+      await deleteItemInSupabase(collection, id);
+      setData((prev) => prev.filter((x) => x.id !== id));
+      window.dispatchEvent(new CustomEvent(DB_UPDATE_EVENT, { detail: { timestamp: Date.now() } }));
+    } catch (err: any) {
+      console.error(`[Supabase] Error deleting item ${id} from ${collection}:`, err);
+      throw err;
+    }
+  };
+
+  // Reorder items in Supabase
+  const reorder = async (orderedIds: string[]): Promise<void> => {
+    try {
+      // Optimistic update
+      const map = new Map(data.map((item) => [item.id, item]));
+      const nextOrdered: any[] = [];
+      orderedIds.forEach((id, idx) => {
+        const item = map.get(id);
+        if (item) {
+          nextOrdered.push({ ...item, order: idx + 1 });
+          map.delete(id);
+        }
+      });
+      map.forEach((item) => nextOrdered.push(item));
+      setData(nextOrdered);
+
+      await reorderItemsInSupabase(collection, orderedIds);
+      window.dispatchEvent(new CustomEvent(DB_UPDATE_EVENT, { detail: { timestamp: Date.now() } }));
+    } catch (err: any) {
+      console.error(`[Supabase] Error reordering items in ${collection}:`, err);
+      fetchItems(); // Rollback on failure
+      throw err;
+    }
+  };
+
+  // Toggle status or visibility in Supabase
+  const toggleStatus = async (id: string): Promise<void> => {
+    const item = data.find((x) => x.id === id);
+    if (!item) return;
+
+    const currentVal = collection === 'blogs' ? item.status : item.show;
+    try {
+      const updated = await toggleItemStatusInSupabase(collection, id, currentVal);
+      setData((prev) => prev.map((x) => (x.id === id ? { ...x, ...updated } : x)));
+      window.dispatchEvent(new CustomEvent(DB_UPDATE_EVENT, { detail: { timestamp: Date.now() } }));
+    } catch (err: any) {
+      console.error(`[Supabase] Error toggling status for ${id} in ${collection}:`, err);
+      throw err;
+    }
+  };
 
   return {
-    items: data as any[],
-    refresh,
-    create: (item: any) => createItem(collection, item),
-    update: (id: string, updates: any) => updateItem(collection, id, updates),
-    remove: (id: string) => deleteItem(collection, id),
-    reorder: (orderedIds: string[]) => reorderCollection(collection, orderedIds),
-    toggleStatus: (id: string) => toggleItemStatus(collection, id),
+    items: data,
+    loading,
+    error,
+    refresh: fetchItems,
+    create,
+    update,
+    remove,
+    reorder,
+    toggleStatus,
   };
 }

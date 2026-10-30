@@ -10,6 +10,7 @@ import {
   GitCommit,
   HelpCircle,
   Hash,
+  Image as ImageIcon,
   Settings,
   X,
   ExternalLink,
@@ -41,6 +42,7 @@ export const AdminSidebar: React.FC<AdminSidebarProps> = ({ isOpen, onClose }) =
     { to: '/admin/process', label: 'Our Process', icon: GitCommit, count: processSteps.length },
     { to: '/admin/faqs', label: 'FAQ', icon: HelpCircle, count: faqs.length },
     { to: '/admin/site-numbers', label: 'Site Numbers', icon: Hash, count: siteNumbers.length },
+    { to: '/admin/media', label: 'Media Library', icon: ImageIcon },
     { to: '/admin/settings', label: 'Settings & Backups', icon: Settings },
   ];
 

@@ -17,6 +17,7 @@ import { ImageUploader } from '../components/ImageUploader';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { SortableList } from '../components/SortableList';
 import { useToast } from '../components/Toast';
+import { uploadMediaToStorage } from '../../lib/storageService';
 
 export const VideoReviewsAdmin: React.FC = () => {
   const { items: videoReviews, create, update, remove, reorder, toggleStatus } =
@@ -276,18 +277,42 @@ export const VideoReviewsAdmin: React.FC = () => {
               </div>
 
               <div>
-                <label className="block text-xs font-semibold uppercase tracking-wider text-muted">
-                  Video URL (YouTube Shorts or YouTube Video Link)
-                </label>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-muted">
+                    Video URL (YouTube or Cloud Storage MP4)
+                  </label>
+                  <label className="cursor-pointer text-xs font-semibold text-[color:var(--color-brand-blue)] hover:underline flex items-center gap-1">
+                    Upload MP4 / WebM Video
+                    <input
+                      type="file"
+                      accept="video/mp4,video/webm,video/quicktime"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        try {
+                          showToast('Uploading video file to cloud storage...');
+                          const res = await uploadMediaToStorage(file, { folder: 'video-reviews' });
+                          setVideoUrl(res.url);
+                          showToast('Video uploaded successfully!');
+                        } catch (err: any) {
+                          showToast('Video upload failed: ' + (err?.message || err), 'error');
+                        } finally {
+                          e.target.value = '';
+                        }
+                      }}
+                    />
+                  </label>
+                </div>
                 <input
                   type="text"
                   value={videoUrl}
                   onChange={(e) => setVideoUrl(e.target.value)}
-                  placeholder="https://www.youtube.com/shorts/... or https://youtu.be/..."
+                  placeholder="https://www.youtube.com/shorts/... or https://...supabase.co/.../video.mp4"
                   className="mt-1 w-full rounded-xl border border-[var(--border)] bg-app px-3 py-2 text-xs text-app font-mono focus:border-[color:var(--color-brand-blue)] focus:outline-none"
                 />
                 <p className="mt-1 text-[11px] text-dim">
-                  Paste any YouTube link, Shorts, or direct video URL. If left empty, a placeholder card will show.
+                  Paste any YouTube link, Shorts, or direct video URL (or click "Upload MP4 / WebM Video" above).
                 </p>
               </div>
 
@@ -324,6 +349,7 @@ export const VideoReviewsAdmin: React.FC = () => {
                 label="Video Thumbnail Image"
                 value={thumbnail}
                 onChange={setThumbnail}
+                folder="video-reviews"
                 helperText="Upload custom portrait 9:16 thumbnail or leave empty to auto-load YouTube poster"
               />
 

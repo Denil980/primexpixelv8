@@ -15,6 +15,7 @@ import { ServicesAdmin } from './pages/ServicesAdmin';
 import { ProcessAdmin } from './pages/ProcessAdmin';
 import { FAQAdmin } from './pages/FAQAdmin';
 import { SiteNumbersAdmin } from './pages/SiteNumbersAdmin';
+import { MediaAdmin } from './pages/MediaAdmin';
 import { SettingsAdmin } from './pages/SettingsAdmin';
 
 export const AdminApp: React.FC = () => {
@@ -42,6 +43,7 @@ export const AdminApp: React.FC = () => {
             <Route path="process" element={<ProcessAdmin />} />
             <Route path="faqs" element={<FAQAdmin />} />
             <Route path="site-numbers" element={<SiteNumbersAdmin />} />
+            <Route path="media" element={<MediaAdmin />} />
             <Route path="settings" element={<SettingsAdmin />} />
           </Route>
 

@@ -1,103 +1,188 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react';
+import { supabase } from '../../lib/supabase';
 
-interface AuthUser {
+export interface AuthUser {
+  id: string;
   email: string;
   name: string;
-  role: 'owner';
+  role: 'owner' | 'admin' | 'editor';
+  themePreference?: 'dark' | 'light' | 'system';
 }
 
-interface AuthContextType {
+export interface AuthContextType {
   user: AuthUser | null;
   isAuthenticated: boolean;
   isLoading: boolean;
   login: (email: string, pass: string) => Promise<{ success: boolean; error?: string }>;
-  logout: () => void;
+  logout: () => Promise<void>;
   sessionTimeoutMinutes: number;
-  setSessionTimeoutMinutes: (mins: number) => void;
+  setSessionTimeoutMinutes: (mins: number) => Promise<void>;
   remainingSeconds: number;
-  updatePassword: (oldPass: string, newPass: string) => { success: boolean; error?: string };
+  updatePassword: (oldPass: string, newPass: string) => Promise<{ success: boolean; error?: string }>;
+  refreshProfile: () => Promise<void>;
 }
 
-const SESSION_KEY = 'primexpixel_admin_session';
-const SETTINGS_KEY = 'primexpixel_admin_auth_cfg';
-
-const DEFAULT_CREDENTIALS = {
-  email: 'admin@primexpixel.com',
-  password: 'primexpixel2026!',
-  name: 'PrimeXPixel Owner',
-  timeoutMinutes: 60,
-};
-
 const AuthContext = createContext<AuthContextType | null>(null);
+
+const DEFAULT_TIMEOUT_MINUTES = 60;
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [isLoading, setIsLoading] = useState(true);
-  const [timeoutMinutes, setTimeoutMinutes] = useState(DEFAULT_CREDENTIALS.timeoutMinutes);
-  const [remainingSeconds, setRemainingSeconds] = useState(3600);
-  const timerRef = useRef<any>(null);
+  const [timeoutMinutes, setTimeoutMinutes] = useState(DEFAULT_TIMEOUT_MINUTES);
+  const [remainingSeconds, setRemainingSeconds] = useState(DEFAULT_TIMEOUT_MINUTES * 60);
 
-  // Load configured settings
-  const getAuthSettings = () => {
+  const timerRef = useRef<any>(null);
+  const lastActivityRef = useRef<number>(Date.now());
+
+  // Helper to fetch and verify the administrator's database profile from public.admin_users
+  const fetchAdminProfile = async (userId: string, authEmail: string): Promise<AuthUser | null> => {
     try {
-      const raw = localStorage.getItem(SETTINGS_KEY);
-      if (raw) return JSON.parse(raw);
-    } catch {}
-    return DEFAULT_CREDENTIALS;
+      const { data, error } = await supabase
+        .from('admin_users')
+        .select('id, email, full_name, role, theme_preference')
+        .eq('id', userId)
+        .maybeSingle();
+
+      if (error) {
+        console.error('[Auth] Failed to query admin_users profile:', error.message);
+        return null;
+      }
+
+      if (!data) {
+        console.warn('[Auth] No profile found in admin_users for user ID:', userId);
+        return null;
+      }
+
+      // Verify authorized role
+      if (!['owner', 'admin', 'editor'].includes(data.role)) {
+        console.warn('[Auth] User role is not authorized for admin access:', data.role);
+        return null;
+      }
+
+      return {
+        id: data.id,
+        email: data.email || authEmail,
+        name: data.full_name || 'Admin',
+        role: data.role as 'owner' | 'admin' | 'editor',
+        themePreference: data.theme_preference || 'system',
+      };
+    } catch (err) {
+      console.error('[Auth] Unexpected error fetching admin profile:', err);
+      return null;
+    }
   };
 
-  const logout = useCallback(() => {
-    localStorage.removeItem(SESSION_KEY);
-    setUser(null);
-  }, []);
-
-  // Check existing session
-  useEffect(() => {
+  // Helper to fetch session timeout setting from public.admin_settings
+  const fetchSessionTimeout = async (): Promise<number> => {
     try {
-      const rawSession = localStorage.getItem(SESSION_KEY);
-      const settings = getAuthSettings();
-      setTimeoutMinutes(settings.timeoutMinutes || 60);
+      const { data, error } = await supabase
+        .from('admin_settings')
+        .select('value')
+        .eq('key', 'session_timeout_minutes')
+        .maybeSingle();
 
-      if (rawSession) {
-        const session = JSON.parse(rawSession);
-        const now = Date.now();
-        if (session && session.expiresAt > now) {
-          setUser({
-            email: session.email,
-            name: settings.name || 'PrimeXPixel Owner',
-            role: 'owner',
-          });
-          const remaining = Math.max(0, Math.floor((session.expiresAt - now) / 1000));
-          setRemainingSeconds(remaining);
-        } else {
-          localStorage.removeItem(SESSION_KEY);
-          setUser(null);
+      if (!error && data && data.value !== null && data.value !== undefined) {
+        const val = Number(data.value);
+        if (!isNaN(val) && val >= 5 && val <= 1440) {
+          return val;
         }
       }
-    } catch (e) {
-      localStorage.removeItem(SESSION_KEY);
-      setUser(null);
+    } catch (err) {
+      console.warn('[Auth] Could not load session_timeout_minutes from admin_settings:', err);
+    }
+    return DEFAULT_TIMEOUT_MINUTES;
+  };
+
+  // Sign out handler
+  const logout = useCallback(async () => {
+    try {
+      await supabase.auth.signOut();
+    } catch (err) {
+      console.error('[Auth] Sign out error:', err);
     } finally {
-      setIsLoading(false);
+      setUser(null);
+      setRemainingSeconds(0);
     }
   }, []);
 
-  // Update session expiry on user activity
-  const refreshSession = useCallback(() => {
-    if (!user) return;
-    try {
-      const rawSession = localStorage.getItem(SESSION_KEY);
-      if (rawSession) {
-        const session = JSON.parse(rawSession);
-        const expiresAt = Date.now() + timeoutMinutes * 60 * 1000;
-        session.expiresAt = expiresAt;
-        localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-        setRemainingSeconds(timeoutMinutes * 60);
-      }
-    } catch {}
-  }, [user, timeoutMinutes]);
+  // Initialize session from Supabase on mount
+  useEffect(() => {
+    let isMounted = true;
 
-  // Activity listeners
+    const initSession = async () => {
+      try {
+        const { data: { session }, error } = await supabase.auth.getSession();
+        if (error) {
+          console.warn('[Auth] getSession warning:', error.message);
+        }
+
+        if (session && session.user) {
+          const profile = await fetchAdminProfile(session.user.id, session.user.email || '');
+          if (profile) {
+            if (isMounted) {
+              setUser(profile);
+              const timeout = await fetchSessionTimeout();
+              setTimeoutMinutes(timeout);
+              lastActivityRef.current = Date.now();
+              setRemainingSeconds(timeout * 60);
+            }
+          } else {
+            console.warn('[Auth] Authenticated user has no valid admin profile. Signing out.');
+            await supabase.auth.signOut();
+            if (isMounted) setUser(null);
+          }
+        } else {
+          if (isMounted) setUser(null);
+        }
+      } catch (err) {
+        console.error('[Auth] Initialization error:', err);
+        if (isMounted) setUser(null);
+      } finally {
+        if (isMounted) setIsLoading(false);
+      }
+    };
+
+    initSession();
+
+    // Listen for auth state changes from Supabase Auth
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(
+      async (event, session) => {
+        if (event === 'SIGNED_IN' && session?.user) {
+          const profile = await fetchAdminProfile(session.user.id, session.user.email || '');
+          if (profile) {
+            if (isMounted) {
+              setUser(profile);
+              const timeout = await fetchSessionTimeout();
+              setTimeoutMinutes(timeout);
+              lastActivityRef.current = Date.now();
+              setRemainingSeconds(timeout * 60);
+            }
+          } else {
+            await supabase.auth.signOut();
+            if (isMounted) setUser(null);
+          }
+        } else if (event === 'SIGNED_OUT') {
+          if (isMounted) {
+            setUser(null);
+            setRemainingSeconds(0);
+          }
+        }
+      }
+    );
+
+    return () => {
+      isMounted = false;
+      subscription.unsubscribe();
+    };
+  }, []);
+
+  // Activity listeners to update countdown timer
+  const recordActivity = useCallback(() => {
+    lastActivityRef.current = Date.now();
+    setRemainingSeconds(timeoutMinutes * 60);
+  }, [timeoutMinutes]);
+
   useEffect(() => {
     if (!user) return;
 
@@ -105,9 +190,9 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const handleActivity = () => {
       if (!throttleTimeout) {
         throttleTimeout = setTimeout(() => {
-          refreshSession();
+          recordActivity();
           throttleTimeout = null;
-        }, 10000); // Throttle activity updates to once every 10s
+        }, 5000); // Throttle activity updates to once every 5 seconds
       }
     };
 
@@ -125,27 +210,19 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       window.removeEventListener('scroll', handleActivity);
       window.removeEventListener('touchstart', handleActivity);
     };
-  }, [user, refreshSession]);
+  }, [user, recordActivity]);
 
-  // Expiration countdown
+  // Session timeout countdown timer
   useEffect(() => {
     if (!user) return;
 
     timerRef.current = setInterval(() => {
-      try {
-        const rawSession = localStorage.getItem(SESSION_KEY);
-        if (rawSession) {
-          const session = JSON.parse(rawSession);
-          const remaining = Math.max(0, Math.floor((session.expiresAt - Date.now()) / 1000));
-          setRemainingSeconds(remaining);
+      const elapsed = Math.floor((Date.now() - lastActivityRef.current) / 1000);
+      const remaining = Math.max(0, timeoutMinutes * 60 - elapsed);
+      setRemainingSeconds(remaining);
 
-          if (remaining <= 0) {
-            logout();
-          }
-        } else {
-          logout();
-        }
-      } catch {
+      if (remaining <= 0) {
+        console.warn('[Auth] Inactivity timeout expired. Terminating session.');
         logout();
       }
     }, 1000);
@@ -153,55 +230,117 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return () => {
       if (timerRef.current) clearInterval(timerRef.current);
     };
-  }, [user, logout]);
+  }, [user, timeoutMinutes, logout]);
 
+  // Authenticate using Supabase Auth
   const login = async (email: string, pass: string): Promise<{ success: boolean; error?: string }> => {
-    // Artificial small delay for security feel
-    await new Promise((r) => setTimeout(r, 400));
+    try {
+      const cleanEmail = email.trim().toLowerCase();
 
-    const settings = getAuthSettings();
-    if (
-      email.trim().toLowerCase() === settings.email.toLowerCase() &&
-      pass === settings.password
-    ) {
-      const expiresAt = Date.now() + (settings.timeoutMinutes || 60) * 60 * 1000;
-      const session = {
-        email: settings.email,
-        token: `px_${Date.now()}_${Math.random().toString(36).substring(2)}`,
-        expiresAt,
-      };
-      localStorage.setItem(SESSION_KEY, JSON.stringify(session));
-      setUser({
-        email: settings.email,
-        name: settings.name || 'PrimeXPixel Owner',
-        role: 'owner',
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: cleanEmail,
+        password: pass,
       });
-      setRemainingSeconds((settings.timeoutMinutes || 60) * 60);
-      return { success: true };
-    }
 
-    return { success: false, error: 'Invalid email or password. Please verify credentials.' };
+      if (error) {
+        return {
+          success: false,
+          error: error.message || 'Invalid email or password. Please verify credentials.',
+        };
+      }
+
+      if (!data.user) {
+        return { success: false, error: 'Authentication failed: No user record returned.' };
+      }
+
+      // Retrieve and verify administrator role in public.admin_users
+      const profile = await fetchAdminProfile(data.user.id, data.user.email || cleanEmail);
+      if (!profile) {
+        // Authenticated in Auth, but not authorized in admin_users
+        await supabase.auth.signOut();
+        return {
+          success: false,
+          error: 'Access denied: You do not have administrator permissions for this system.',
+        };
+      }
+
+      setUser(profile);
+      const timeout = await fetchSessionTimeout();
+      setTimeoutMinutes(timeout);
+      lastActivityRef.current = Date.now();
+      setRemainingSeconds(timeout * 60);
+
+      return { success: true };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'An unexpected error occurred during authentication.',
+      };
+    }
   };
 
-  const updatePassword = (oldPass: string, newPass: string): { success: boolean; error?: string } => {
-    const settings = getAuthSettings();
-    if (oldPass !== settings.password) {
-      return { success: false, error: 'Current password is incorrect.' };
+  // Update password using Supabase Auth
+  const updatePassword = async (oldPass: string, newPass: string): Promise<{ success: boolean; error?: string }> => {
+    if (!user) {
+      return { success: false, error: 'User is not authenticated.' };
     }
+
     if (newPass.length < 6) {
       return { success: false, error: 'New password must be at least 6 characters.' };
     }
-    settings.password = newPass;
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-    return { success: true };
+
+    try {
+      // 1. Re-authenticate with old password to verify current credentials
+      const { error: verifyError } = await supabase.auth.signInWithPassword({
+        email: user.email,
+        password: oldPass,
+      });
+
+      if (verifyError) {
+        return { success: false, error: 'Current password is incorrect.' };
+      }
+
+      // 2. Update to new password via Supabase Auth
+      const { error: updateError } = await supabase.auth.updateUser({
+        password: newPass,
+      });
+
+      if (updateError) {
+        return { success: false, error: updateError.message };
+      }
+
+      return { success: true };
+    } catch (err: any) {
+      return {
+        success: false,
+        error: err?.message || 'An error occurred while updating the password.',
+      };
+    }
   };
 
-  const handleSetTimeout = (mins: number) => {
+  // Update session timeout setting in database and local state
+  const handleSetTimeout = async (mins: number) => {
+    if (mins < 5 || mins > 1440) return;
     setTimeoutMinutes(mins);
-    const settings = getAuthSettings();
-    settings.timeoutMinutes = mins;
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
-    refreshSession();
+    lastActivityRef.current = Date.now();
+    setRemainingSeconds(mins * 60);
+
+    try {
+      await supabase
+        .from('admin_settings')
+        .update({ value: mins })
+        .eq('key', 'session_timeout_minutes');
+    } catch (err) {
+      console.warn('[Auth] Failed to persist session timeout to admin_settings:', err);
+    }
+  };
+
+  const refreshProfile = async () => {
+    if (!user) return;
+    const profile = await fetchAdminProfile(user.id, user.email);
+    if (profile) {
+      setUser(profile);
+    }
   };
 
   return (
@@ -216,6 +355,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setSessionTimeoutMinutes: handleSetTimeout,
         remainingSeconds,
         updatePassword,
+        refreshProfile,
       }}
     >
       {children}

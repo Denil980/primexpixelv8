@@ -5,12 +5,12 @@ import { useSEO, SITE } from '../lib/useSEO';
 import Breadcrumbs from '../components/Breadcrumbs';
 import CTASection from '../components/CTASection';
 import Button from '../components/Button';
-import { useLiveBlogs } from '../lib/useAdminData';
+import { useLiveBlogsWithState } from '../lib/useAdminData';
 
 export default function BlogPost() {
   useReveal();
   const { slug } = useParams();
-  const liveBlogs = useLiveBlogs();
+  const { data: liveBlogs, loading } = useLiveBlogsWithState();
   const post = liveBlogs.find((p: any) => p.slug === slug);
 
   const related = liveBlogs.filter((p: any) => p.slug !== slug).slice(0, 3);
@@ -73,6 +73,15 @@ export default function BlogPost() {
         ]
       : undefined,
   });
+
+  if (!post && loading) {
+    return (
+      <div className="min-h-[60vh] flex flex-col items-center justify-center">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[color:var(--color-brand-blue)] border-t-transparent" />
+        <p className="mt-4 text-xs text-muted">Loading article...</p>
+      </div>
+    );
+  }
 
   if (!post) return <Navigate to="/blog" replace />;
 

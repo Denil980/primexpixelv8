@@ -496,6 +496,7 @@ export const ServicesAdmin: React.FC = () => {
                   label="Hero Image (Displayed in Hero Section)"
                   value={heroImage}
                   onChange={setHeroImage}
+                  folder="services"
                   helperText="High-resolution hero visual representing this service (auto-compressed to WebP)"
                 />
               </div>

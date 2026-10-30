@@ -4,8 +4,8 @@ import { useAuth } from '../auth/AuthContext';
 import { Lock, Mail, ArrowRight, ShieldCheck, Eye, EyeOff, AlertCircle } from 'lucide-react';
 
 export const AdminLogin: React.FC = () => {
-  const [email, setEmail] = useState('admin@primexpixel.com');
-  const [password, setPassword] = useState('primexpixel2026!');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -133,12 +133,10 @@ export const AdminLogin: React.FC = () => {
             </button>
           </form>
 
-          {/* Quick Default Credentials Hint */}
+          {/* Security Notice */}
           <div className="mt-6 border-t border-[var(--border)] pt-4 text-center">
             <p className="text-[11px] text-dim">
-              Default Owner: <span className="text-app font-mono">admin@primexpixel.com</span>
-              <br />
-              Default Password: <span className="text-app font-mono">primexpixel2026!</span>
+              Secured with Supabase Authentication & Role-Based Access Control
             </p>
           </div>
         </div>

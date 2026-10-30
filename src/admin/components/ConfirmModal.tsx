@@ -4,7 +4,7 @@ import { AlertTriangle, X } from 'lucide-react';
 interface ConfirmModalProps {
   isOpen: boolean;
   title: string;
-  message: string;
+  message: string | React.ReactNode;
   confirmLabel?: string;
   cancelLabel?: string;
   isDestructive?: boolean;
@@ -43,7 +43,7 @@ export const ConfirmModal: React.FC<ConfirmModalProps> = ({
             </div>
             <div className="flex-1">
               <h3 className="font-display text-lg font-semibold text-app">{title}</h3>
-              <p className="mt-2 text-sm leading-relaxed text-muted">{message}</p>
+              <div className="mt-2 text-sm leading-relaxed text-muted">{message}</div>
             </div>
             <button
               onClick={onCancel}

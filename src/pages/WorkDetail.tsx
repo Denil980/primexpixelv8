@@ -8,7 +8,7 @@ import { useSEO, SITE } from '../lib/useSEO';
 import Breadcrumbs from '../components/Breadcrumbs';
 import CTASection from '../components/CTASection';
 import Button from '../components/Button';
-import { useLiveWorks } from '../lib/useAdminData';
+import { useLiveWorksWithState } from '../lib/useAdminData';
 
 function Chip({ children }: { children: React.ReactNode }) {
   return (
@@ -35,7 +35,7 @@ function Block({ icon: Icon, title, children }: { icon: React.ElementType; title
 export default function WorkDetail() {
   useReveal();
   const { slug } = useParams();
-  const workItems = useLiveWorks();
+  const { data: workItems, loading } = useLiveWorksWithState();
   const item = workItems.find((w: any) => w.slug === slug);
   const related = workItems.filter((w: any) => w.slug !== slug).slice(0, 3);
 
@@ -56,6 +56,15 @@ export default function WorkDetail() {
         }
       : undefined,
   });
+
+  if (!item && loading) {
+    return (
+      <div className="min-h-[60vh] flex flex-col items-center justify-center">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[color:var(--color-brand-blue)] border-t-transparent" />
+        <p className="mt-4 text-xs text-muted">Loading case study...</p>
+      </div>
+    );
+  }
 
   if (!item) return <Navigate to="/work" replace />;
   const d = item.detail;

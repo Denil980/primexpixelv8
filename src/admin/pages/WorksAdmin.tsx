@@ -19,6 +19,7 @@ import { ImageUploader } from '../components/ImageUploader';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { SortableList } from '../components/SortableList';
 import { useToast } from '../components/Toast';
+import { uploadMediaToStorage } from '../../lib/storageService';
 
 const WORK_CATEGORIES = ['Website', 'UI/UX', 'Logo', 'Social Media', 'Video Editing'];
 
@@ -469,14 +470,40 @@ export const WorksAdmin: React.FC = () => {
                 label="Cover Image (Auto-Compressed to WebP)"
                 value={coverImage}
                 onChange={setCoverImage}
+                folder="works"
                 helperText="Primary banner / thumbnail for portfolio grid"
               />
 
               {/* Gallery Images */}
               <div className="space-y-2 rounded-2xl border border-[var(--border)] bg-app p-4">
-                <label className="block text-xs font-semibold uppercase tracking-wider text-muted">
-                  Gallery Images ({galleryInput.length})
-                </label>
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold uppercase tracking-wider text-muted">
+                    Gallery Images ({galleryInput.length})
+                  </label>
+                  <label className="cursor-pointer text-xs font-semibold text-[color:var(--color-brand-blue)] hover:underline flex items-center gap-1">
+                    <Plus className="h-3.5 w-3.5" />
+                    Upload from Computer
+                    <input
+                      type="file"
+                      accept="image/jpeg,image/png,image/webp,image/gif"
+                      className="hidden"
+                      onChange={async (e) => {
+                        const file = e.target.files?.[0];
+                        if (!file) return;
+                        try {
+                          showToast('Uploading gallery image to cloud storage...');
+                          const res = await uploadMediaToStorage(file, { folder: 'works' });
+                          handleAddGalleryImage(res.url);
+                          showToast('Gallery image uploaded successfully!');
+                        } catch (err: any) {
+                          showToast('Failed to upload image: ' + (err?.message || err), 'error');
+                        } finally {
+                          e.target.value = '';
+                        }
+                      }}
+                    />
+                  </label>
+                </div>
                 <div className="flex gap-2">
                   <input
                     type="text"
@@ -490,7 +517,7 @@ export const WorksAdmin: React.FC = () => {
                     onClick={() => handleAddGalleryImage(newGalleryUrl)}
                     className="flex items-center gap-1 rounded-xl bg-white/10 px-3 py-1.5 text-xs font-medium text-app hover:bg-white/15"
                   >
-                    <Plus className="h-3.5 w-3.5" /> Add Image
+                    <Plus className="h-3.5 w-3.5" /> Add URL
                   </button>
                 </div>
 

@@ -1,25 +1,46 @@
 import React, { useState, useRef } from 'react';
-import { Upload, X, Image as ImageIcon, AlertCircle, CheckCircle2, RefreshCw } from 'lucide-react';
+import {
+  Upload,
+  X,
+  Image as ImageIcon,
+  AlertCircle,
+  CheckCircle2,
+  RefreshCw,
+  Video,
+  ExternalLink,
+} from 'lucide-react';
+import {
+  replaceMediaInStorage,
+  deleteMediaFromStorage,
+  validateMediaFile,
+  isStorageUrl,
+} from '../../lib/storageService';
 
 interface ImageUploaderProps {
   label: string;
   value: string;
   onChange: (url: string) => void;
+  folder?: 'blogs' | 'works' | 'reviews' | 'services' | 'video-reviews' | 'general';
   helperText?: string;
   maxDimension?: number;
   quality?: number;
+  acceptVideo?: boolean;
 }
 
 export const ImageUploader: React.FC<ImageUploaderProps> = ({
   label,
   value,
   onChange,
-  helperText = 'Upload JPEG, PNG or WebP. Automatically compressed to WebP.',
+  folder = 'general',
+  helperText,
   maxDimension = 1600,
   quality = 0.82,
+  acceptVideo = false,
 }) => {
   const [isDragging, setIsDragging] = useState(false);
-  const [compressing, setCompressing] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState(0);
+  const [localPreview, setLocalPreview] = useState<string | null>(null);
   const [compressionStats, setCompressionStats] = useState<{
     originalSize: string;
     compressedSize: string;
@@ -28,6 +49,10 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
   const [error, setError] = useState<string | null>(null);
   const [showUrlInput, setShowUrlInput] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const defaultHelper = acceptVideo
+    ? 'Upload JPEG, PNG, WebP image or MP4/WebM video. Images auto-converted to WebP.'
+    : 'Upload JPEG, PNG or WebP. Automatically converted to optimized WebP.';
 
   const formatSize = (bytes: number) => {
     if (bytes < 1024) return `${bytes} B`;
@@ -39,95 +64,55 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
     setError(null);
     setCompressionStats(null);
 
-    // Validate type
-    const validTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
-    if (!validTypes.includes(file.type)) {
-      setError(`Unsupported file type: ${file.type || 'unknown'}. Please choose JPEG, PNG or WebP.`);
+    // Validation
+    const allowed = acceptVideo
+      ? [
+          'image/jpeg',
+          'image/png',
+          'image/webp',
+          'image/gif',
+          'image/svg+xml',
+          'video/mp4',
+          'video/webm',
+          'video/quicktime',
+        ]
+      : ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+
+    const validation = validateMediaFile(file, allowed, acceptVideo ? 50 * 1024 * 1024 : 15 * 1024 * 1024);
+    if (!validation.valid) {
+      setError(validation.error || 'Invalid file');
       return;
     }
 
-    // Validate size (max 15MB)
-    if (file.size > 15 * 1024 * 1024) {
-      setError(`File is too large (${formatSize(file.size)}). Maximum allowed size is 15 MB.`);
-      return;
-    }
-
-    // SVG / GIF can be used directly without raster compression
-    if (file.type === 'image/svg+xml' || file.type === 'image/gif') {
-      const reader = new FileReader();
-      reader.onload = () => {
-        onChange(reader.result as string);
-        setCompressionStats({
-          originalSize: formatSize(file.size),
-          compressedSize: formatSize(file.size),
-          reductionPercent: 0,
-        });
-      };
-      reader.readAsDataURL(file);
-      return;
-    }
-
-    setCompressing(true);
+    // Instant local preview
+    const tempPreview = URL.createObjectURL(file);
+    setLocalPreview(tempPreview);
+    setUploading(true);
+    setUploadProgress(15);
 
     try {
-      const img = new Image();
-      const objectUrl = URL.createObjectURL(file);
+      const result = await replaceMediaInStorage(value, file, {
+        folder,
+        maxDimension,
+        quality,
+        onProgress: (p) => setUploadProgress(p),
+      });
 
-      img.onload = () => {
-        URL.revokeObjectURL(objectUrl);
+      onChange(result.url);
 
-        let { width, height } = img;
-        if (width > maxDimension || height > maxDimension) {
-          if (width > height) {
-            height = Math.round((height * maxDimension) / width);
-            width = maxDimension;
-          } else {
-            width = Math.round((width * maxDimension) / height);
-            height = maxDimension;
-          }
-        }
-
-        const canvas = document.createElement('canvas');
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-
-        if (!ctx) {
-          setError('Failed to process image on device canvas.');
-          setCompressing(false);
-          return;
-        }
-
-        ctx.drawImage(img, 0, 0, width, height);
-        const webpDataUrl = canvas.toDataURL('image/webp', quality);
-
-        // Approximate base64 to byte size
-        const compressedBytes = Math.round((webpDataUrl.length * 3) / 4);
-        const originalBytes = file.size;
-        const reduction = Math.max(
-          0,
-          Math.round(((originalBytes - compressedBytes) / originalBytes) * 100)
-        );
-
-        onChange(webpDataUrl);
+      if (result.compression) {
         setCompressionStats({
-          originalSize: formatSize(originalBytes),
-          compressedSize: formatSize(compressedBytes),
-          reductionPercent: reduction,
+          originalSize: formatSize(result.compression.originalSize),
+          compressedSize: formatSize(result.compression.compressedSize),
+          reductionPercent: result.compression.reductionPercent,
         });
-        setCompressing(false);
-      };
-
-      img.onerror = () => {
-        URL.revokeObjectURL(objectUrl);
-        setError('Failed to read and process image file.');
-        setCompressing(false);
-      };
-
-      img.src = objectUrl;
-    } catch (e: any) {
-      setError(e?.message || 'Error occurred while compressing image.');
-      setCompressing(false);
+      }
+    } catch (err: any) {
+      setError(err?.message || 'Upload failed. Check Supabase Storage bucket status.');
+      setLocalPreview(null);
+    } finally {
+      setUploading(false);
+      URL.revokeObjectURL(tempPreview);
     }
   };
 
@@ -145,6 +130,23 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
     }
   };
 
+  const handleRemove = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (value && isStorageUrl(value)) {
+      try {
+        await deleteMediaFromStorage(value);
+      } catch (err: any) {
+        console.warn('Could not remove file from storage:', err.message);
+      }
+    }
+    onChange('');
+    setLocalPreview(null);
+    setCompressionStats(null);
+  };
+
+  const currentMediaUrl = localPreview || value;
+  const isVideo = currentMediaUrl?.match(/\.(mp4|webm|mov)(\?.*)?$/i) || currentMediaUrl?.startsWith('data:video/');
+
   return (
     <div className="space-y-2">
       <div className="flex items-center justify-between">
@@ -156,7 +158,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
           onClick={() => setShowUrlInput(!showUrlInput)}
           className="text-xs text-[color:var(--color-brand-blue)] hover:underline"
         >
-          {showUrlInput ? 'Upload File' : 'Paste Direct URL / Path'}
+          {showUrlInput ? 'Upload to Cloud Storage' : 'Paste Direct URL / Path'}
         </button>
       </div>
 
@@ -172,7 +174,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
           {value && (
             <button
               type="button"
-              onClick={() => onChange('')}
+              onClick={handleRemove}
               className="p-2 text-dim hover:text-red-400"
               title="Clear"
             >
@@ -198,26 +200,36 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
           <input
             ref={fileInputRef}
             type="file"
-            accept="image/jpeg,image/png,image/webp,image/gif,image/svg+xml"
+            accept={
+              acceptVideo
+                ? 'image/jpeg,image/png,image/webp,image/gif,image/svg+xml,video/mp4,video/webm,video/quicktime'
+                : 'image/jpeg,image/png,image/webp,image/gif,image/svg+xml'
+            }
             onChange={handleFileChange}
             className="hidden"
           />
 
-          {compressing ? (
-            <div className="flex flex-col items-center gap-2 py-4">
+          {uploading ? (
+            <div className="flex flex-col items-center gap-3 py-4 w-full max-w-xs">
               <RefreshCw className="h-8 w-8 animate-spin text-[color:var(--color-brand-blue)]" />
-              <p className="text-sm font-medium text-app">Compressing to WebP...</p>
-              <p className="text-xs text-muted">Optimizing resolution & file size</p>
+              <p className="text-sm font-medium text-app">Uploading to Cloud Storage...</p>
+              <div className="w-full bg-white/10 rounded-full h-1.5 overflow-hidden">
+                <div
+                  className="gradient-brand h-full transition-all duration-300"
+                  style={{ width: `${uploadProgress}%` }}
+                />
+              </div>
+              <p className="text-xs text-muted font-mono">{uploadProgress}% complete</p>
             </div>
           ) : (
             <div className="flex flex-col items-center gap-2">
               <div className="grid h-12 w-12 place-items-center rounded-full bg-[var(--surface-solid)] text-[color:var(--color-brand-blue)] shadow-sm group-hover:scale-110 transition-transform">
-                <Upload className="h-6 w-6" />
+                {acceptVideo ? <Video className="h-6 w-6" /> : <Upload className="h-6 w-6" />}
               </div>
               <p className="text-sm font-medium text-app">
                 <span className="text-[color:var(--color-brand-blue)] font-semibold">Click to upload</span> or drag and drop
               </p>
-              <p className="text-xs text-dim">{helperText}</p>
+              <p className="text-xs text-dim">{helperText || defaultHelper}</p>
             </div>
           )}
         </div>
@@ -237,7 +249,7 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
           <div className="flex items-center gap-2">
             <CheckCircle2 className="h-4 w-4" />
             <span>
-              WebP Compressed: {compressionStats.originalSize} → {compressionStats.compressedSize}
+              WebP Optimized: {compressionStats.originalSize} → {compressionStats.compressedSize}
             </span>
           </div>
           {compressionStats.reductionPercent > 0 && (
@@ -247,36 +259,48 @@ export const ImageUploader: React.FC<ImageUploaderProps> = ({
       )}
 
       {/* Preview Card */}
-      {value && (
+      {currentMediaUrl && (
         <div className="relative mt-2 overflow-hidden rounded-xl border border-[var(--border)] bg-app-2 p-2">
           <div className="relative flex aspect-video max-h-48 w-full items-center justify-center overflow-hidden rounded-lg bg-black/20">
-            <img
-              src={value}
-              alt="Preview"
-              className="h-full w-full object-contain"
-              onError={(e) => {
-                (e.currentTarget as HTMLImageElement).src = '/brand/mark-square.png';
-              }}
-            />
+            {isVideo ? (
+              <video
+                src={currentMediaUrl}
+                controls
+                className="h-full w-full object-contain"
+              />
+            ) : (
+              <img
+                src={currentMediaUrl}
+                alt="Preview"
+                className="h-full w-full object-contain"
+                onError={(e) => {
+                  (e.currentTarget as HTMLImageElement).src = '/brand/mark-square.png';
+                }}
+              />
+            )}
             <button
               type="button"
-              onClick={(e) => {
-                e.stopPropagation();
-                onChange('');
-                setCompressionStats(null);
-              }}
+              onClick={handleRemove}
               className="absolute right-2 top-2 rounded-full bg-black/70 p-1.5 text-white hover:bg-red-600 transition-colors shadow-lg"
-              title="Remove image"
+              title="Remove media"
             >
               <X className="h-4 w-4" />
             </button>
           </div>
           <div className="mt-2 flex items-center justify-between px-1 text-[11px] text-muted">
-            <span className="flex items-center gap-1.5 truncate max-w-[260px]">
+            <span className="flex items-center gap-1.5 truncate max-w-[280px]">
               <ImageIcon className="h-3.5 w-3.5 shrink-0 text-[color:var(--color-brand-blue)]" />
-              <span className="truncate">{value.startsWith('data:') ? 'Base64 WebP Asset' : value}</span>
+              <span className="truncate font-mono text-[10px]">{currentMediaUrl}</span>
             </span>
-            <span className="shrink-0 text-emerald-400 font-medium">Ready</span>
+            {isStorageUrl(currentMediaUrl) ? (
+              <span className="inline-flex items-center gap-1 text-emerald-400 font-medium">
+                <CheckCircle2 className="h-3 w-3" /> Supabase Storage
+              </span>
+            ) : (
+              <span className="inline-flex items-center gap-1 text-dim">
+                <ExternalLink className="h-3 w-3" /> Static / External
+              </span>
+            )}
           </div>
         </div>
       )}

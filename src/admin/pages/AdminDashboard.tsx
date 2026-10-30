@@ -15,7 +15,7 @@ import {
   Download,
   Clock,
 } from 'lucide-react';
-import { useAdminCollection, exportDatabaseJSON } from '../db';
+import { useAdminCollection, exportDatabaseJSON, fetchDashboardCountsRPC } from '../db';
 import { useToast } from '../components/Toast';
 
 export const AdminDashboard: React.FC = () => {
@@ -27,6 +27,14 @@ export const AdminDashboard: React.FC = () => {
   const { items: faqs } = useAdminCollection('faqs');
   const { items: siteNumbers } = useAdminCollection('siteNumbers');
   const { showToast } = useToast();
+
+  const [dbCounts, setDbCounts] = React.useState<any | null>(null);
+
+  React.useEffect(() => {
+    fetchDashboardCountsRPC().then((counts) => {
+      if (counts) setDbCounts(counts);
+    });
+  }, [blogs, reviews, videoReviews, works, services, faqs, siteNumbers]);
 
   const publishedBlogs = blogs.filter((b) => b.status === 'published').length;
   const draftBlogs = blogs.length - publishedBlogs;
@@ -48,47 +56,57 @@ export const AdminDashboard: React.FC = () => {
   const statCards = [
     {
       title: 'Blogs',
-      count: blogs.length,
-      detail: `${publishedBlogs} published, ${draftBlogs} draft`,
+      count: dbCounts ? dbCounts.blogs_total : blogs.length,
+      detail: dbCounts
+        ? `${dbCounts.blogs_published} published, ${dbCounts.blogs_draft} draft`
+        : `${publishedBlogs} published, ${draftBlogs} draft`,
       icon: FileText,
       to: '/admin/blogs',
       color: 'from-blue-500/20 to-blue-500/5 text-blue-400',
     },
     {
       title: 'Our Works',
-      count: works.length,
-      detail: `${activeWorks} visible in portfolio`,
+      count: dbCounts ? dbCounts.works_total : works.length,
+      detail: dbCounts
+        ? `${dbCounts.works_visible} visible in portfolio`
+        : `${activeWorks} visible in portfolio`,
       icon: Briefcase,
       to: '/admin/works',
       color: 'from-emerald-500/20 to-emerald-500/5 text-emerald-400',
     },
     {
       title: 'Services',
-      count: services.length,
-      detail: `${activeServices} active service pages`,
+      count: dbCounts ? dbCounts.services_total : services.length,
+      detail: dbCounts
+        ? `${dbCounts.services_visible} active service pages`
+        : `${activeServices} active service pages`,
       icon: Layers,
       to: '/admin/services',
       color: 'from-purple-500/20 to-purple-500/5 text-purple-400',
     },
     {
       title: 'Text Reviews',
-      count: reviews.length,
-      detail: `${reviews.filter((r) => r.show).length} visible testimonials`,
+      count: dbCounts ? dbCounts.reviews_total : reviews.length,
+      detail: dbCounts
+        ? `${dbCounts.reviews_visible} visible testimonials`
+        : `${reviews.filter((r) => r.show).length} visible testimonials`,
       icon: MessageSquare,
       to: '/admin/reviews',
       color: 'from-amber-500/20 to-amber-500/5 text-amber-400',
     },
     {
       title: 'Video Reviews',
-      count: videoReviews.length,
-      detail: `${videoReviews.filter((v) => v.show).length} active video cards`,
+      count: dbCounts ? dbCounts.video_reviews_total : videoReviews.length,
+      detail: dbCounts
+        ? `${dbCounts.video_reviews_visible} active video cards`
+        : `${videoReviews.filter((v) => v.show).length} active video cards`,
       icon: Video,
       to: '/admin/video-reviews',
       color: 'from-rose-500/20 to-rose-500/5 text-rose-400',
     },
     {
       title: 'Site Numbers',
-      count: siteNumbers.length,
+      count: dbCounts ? dbCounts.site_numbers_total : siteNumbers.length,
       detail: 'Hero, About & Trust stats',
       icon: Hash,
       to: '/admin/site-numbers',
@@ -96,8 +114,10 @@ export const AdminDashboard: React.FC = () => {
     },
     {
       title: 'FAQ Items',
-      count: faqs.length,
-      detail: `${faqs.filter((f) => f.show).length} live questions`,
+      count: dbCounts ? dbCounts.faqs_total : faqs.length,
+      detail: dbCounts
+        ? `${dbCounts.faqs_visible} live questions`
+        : `${faqs.filter((f) => f.show).length} live questions`,
       icon: HelpCircle,
       to: '/admin/faqs',
       color: 'from-indigo-500/20 to-indigo-500/5 text-indigo-400',

@@ -76,8 +76,14 @@ export const AdminNavbar: React.FC<AdminNavbarProps> = ({ onToggleSidebar, title
         <div className="flex items-center gap-2 border-l border-[var(--border)] pl-3 sm:gap-3 sm:pl-4">
           <div className="hidden text-right sm:block">
             <div className="flex items-center gap-1 text-xs font-semibold text-app">
-              <span>{user?.name || 'Owner'}</span>
-              <ShieldCheck className="h-3.5 w-3.5 text-emerald-400" />
+              <span>{user?.name || (user?.role === 'owner' ? 'PrimeXPixel Owner' : 'Admin')}</span>
+              <span title={user?.role ? `${user.role.toUpperCase()} (Verified)` : 'ADMIN'}>
+                <ShieldCheck
+                  className={`h-3.5 w-3.5 ${
+                    user?.role === 'owner' ? 'text-emerald-400' : 'text-blue-400'
+                  }`}
+                />
+              </span>
             </div>
             <div className="text-[10px] text-dim">{user?.email}</div>
           </div>

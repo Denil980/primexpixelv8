@@ -28,7 +28,7 @@ import Breadcrumbs from '../components/Breadcrumbs';
 import CTASection from '../components/CTASection';
 import Button from '../components/Button';
 import { stats, industries, blogPosts } from '../lib/data';
-import { useLiveServices, useLiveWorks, useLiveSiteNumbers, useLiveReviews } from '../lib/useAdminData';
+import { useLiveServicesWithState, useLiveWorks, useLiveSiteNumbers, useLiveReviews } from '../lib/useAdminData';
 import { renderLucideIcon } from '../admin/components/IconPicker';
 
 const DEFAULT_HERO_IMAGES: Record<string, string> = {
@@ -157,7 +157,7 @@ export default function ServiceDetail() {
   useReveal();
   const { slug } = useParams();
 
-  const liveServices = useLiveServices();
+  const { data: liveServices, loading } = useLiveServicesWithState();
   const liveWorks = useLiveWorks();
   const liveStats = useLiveSiteNumbers('Results');
   const liveReviews = useLiveReviews();
@@ -260,6 +260,15 @@ export default function ServiceDetail() {
         }
       : undefined,
   });
+
+  if (!service && loading) {
+    return (
+      <div className="min-h-[60vh] flex flex-col items-center justify-center">
+        <div className="h-8 w-8 animate-spin rounded-full border-2 border-[color:var(--color-brand-blue)] border-t-transparent" />
+        <p className="mt-4 text-xs text-muted">Loading service details...</p>
+      </div>
+    );
+  }
 
   if (!service) return <Navigate to="/services" replace />;
 

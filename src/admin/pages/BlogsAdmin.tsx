@@ -462,6 +462,7 @@ export const BlogsAdmin: React.FC = () => {
                     label="Cover Image (Auto-Compressed to WebP)"
                     value={coverImage}
                     onChange={setCoverImage}
+                    folder="blogs"
                     helperText="Upload JPG/PNG/WebP. Ideal ratio 16:9."
                   />
 

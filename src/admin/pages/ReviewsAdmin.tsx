@@ -376,6 +376,7 @@ export const ReviewsAdmin: React.FC = () => {
                 label="Client Photo (Optional - Leave empty to use initials)"
                 value={photo}
                 onChange={setPhoto}
+                folder="reviews"
                 helperText="Square 1:1 image recommended"
               />
 

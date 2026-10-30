@@ -88,7 +88,7 @@ BEGIN
 
   -- Guard modifications on UPDATE
   IF TG_OP = 'UPDATE' THEN
-    IF NOT public.is_owner() THEN
+    IF NOT (public.is_owner() OR session_user IN ('postgres', 'supabase_admin') OR COALESCE(current_setting('request.jwt.claim.role', true), '') = 'service_role') THEN
       -- Non-owners cannot change role
       IF OLD.role IS DISTINCT FROM NEW.role THEN
         RAISE EXCEPTION 'Unauthorized: Non-owners cannot alter administrator role permissions.';
@@ -104,42 +104,63 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
+REVOKE ALL ON FUNCTION public.sync_and_protect_admin_user() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.sync_and_protect_admin_user() TO authenticated;
+
 DROP TRIGGER IF EXISTS tr_sync_and_protect_admin_user ON public.admin_users;
 CREATE TRIGGER tr_sync_and_protect_admin_user
   BEFORE INSERT OR UPDATE ON public.admin_users
   FOR EACH ROW EXECUTE FUNCTION public.sync_and_protect_admin_user();
 
--- Guard: Concurrency-safe protection preventing removal or demotion of the last remaining owner
-CREATE OR REPLACE FUNCTION public.protect_last_owner()
+-- Guard 1: Concurrency-safe serialization before row modifications are attempted
+-- Acquires an exclusive transaction-scoped advisory lock before any rows are locked or modified.
+-- This serializes competing owner modifications without lock-upgrade deadlocks against relation locks.
+CREATE OR REPLACE FUNCTION public.lock_admin_users_for_owner_change()
 RETURNS TRIGGER AS $$
-DECLARE
-  owner_count INTEGER;
 BEGIN
-  IF (TG_OP = 'DELETE' AND OLD.role = 'owner') OR 
-     (TG_OP = 'UPDATE' AND OLD.role = 'owner' AND NEW.role <> 'owner') THEN
-    -- Serialize all owner demotion/deletion transactions using an exclusive transaction-scoped advisory lock.
-    -- This guarantees zero race conditions where two concurrent requests could leave 0 owners.
-    PERFORM pg_advisory_xact_lock(847291049281749201);
-    
-    SELECT COUNT(*) INTO owner_count FROM public.admin_users WHERE role = 'owner';
-    
-    IF owner_count <= 1 THEN
-      RAISE EXCEPTION 'Operation rejected: Cannot delete or demote the only remaining owner account (concurrency-safe check).';
-    END IF;
-  END IF;
-
-  IF TG_OP = 'DELETE' THEN
-    RETURN OLD;
-  ELSE
-    RETURN NEW;
-  END IF;
+  PERFORM pg_advisory_xact_lock(847291049281749201);
+  RETURN NULL;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
+REVOKE ALL ON FUNCTION public.lock_admin_users_for_owner_change() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.lock_admin_users_for_owner_change() TO authenticated;
+
+DROP TRIGGER IF EXISTS tr_serialize_admin_user_changes ON public.admin_users;
+CREATE TRIGGER tr_serialize_admin_user_changes
+  BEFORE UPDATE OR DELETE ON public.admin_users
+  FOR EACH STATEMENT EXECUTE FUNCTION public.lock_admin_users_for_owner_change();
+
+-- Guard 2: Enforce that at least one owner remains AFTER all row modifications in the statement have completed
+CREATE OR REPLACE FUNCTION public.protect_last_owner()
+RETURNS TRIGGER AS $$
+DECLARE
+  v_has_owner BOOLEAN := false;
+  v_owner_id UUID;
+BEGIN
+  -- Evaluate remaining owners using FOR SHARE to enforce snapshot visibility across all isolation levels
+  FOR v_owner_id IN 
+    SELECT id FROM public.admin_users WHERE role = 'owner' FOR SHARE
+  LOOP
+    v_has_owner := true;
+    EXIT;
+  END LOOP;
+
+  IF NOT v_has_owner THEN
+    RAISE EXCEPTION 'Operation rejected: Cannot delete or demote the only remaining owner account. At least one owner must exist.';
+  END IF;
+
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+REVOKE ALL ON FUNCTION public.protect_last_owner() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.protect_last_owner() TO authenticated;
+
 DROP TRIGGER IF EXISTS tr_protect_last_owner ON public.admin_users;
 CREATE TRIGGER tr_protect_last_owner
-  BEFORE UPDATE OR DELETE ON public.admin_users
-  FOR EACH ROW EXECUTE FUNCTION public.protect_last_owner();
+  AFTER UPDATE OR DELETE ON public.admin_users
+  FOR EACH STATEMENT EXECUTE FUNCTION public.protect_last_owner();
 
 -- ----------------------------------------------------------------------------
 -- 3. SECURE FIRST-OWNER BOOTSTRAP PROCEDURE
@@ -160,13 +181,16 @@ DECLARE
   existing_count INTEGER;
   new_admin public.admin_users;
 BEGIN
-  -- 1. Check if an administrator or owner already exists (one-time execution guarantee)
+  -- 1. Exclusively serialize provisioning via transaction advisory lock
+  PERFORM pg_advisory_xact_lock(847291049281749201);
+
+  -- 2. Check if an administrator or owner already exists (one-time execution guarantee)
   SELECT COUNT(*) INTO existing_count FROM public.admin_users;
   IF existing_count > 0 THEN
     RAISE EXCEPTION 'Bootstrap unavailable: An initial owner has already been provisioned for this system.';
   END IF;
 
-  -- 2. Verify target identity against Supabase auth.users records
+  -- 3. Verify target identity against Supabase auth.users records
   SELECT email INTO verified_auth_email FROM auth.users WHERE id = target_user_id;
   IF verified_auth_email IS NULL THEN
     RAISE EXCEPTION 'User UID % not found in auth.users authentication records.', target_user_id;
@@ -176,12 +200,12 @@ BEGIN
     RAISE EXCEPTION 'Provided email does not match verified auth.users record (expected %)', verified_auth_email;
   END IF;
 
-  -- 3. Insert initial owner record
+  -- 4. Insert initial owner record
   INSERT INTO public.admin_users (id, email, full_name, role, theme_preference)
   VALUES (target_user_id, verified_auth_email, owner_full_name, 'owner', 'system')
   RETURNING * INTO new_admin;
 
-  -- 4. Record tamper-proof audit log entry
+  -- 5. Record tamper-proof audit log entry
   INSERT INTO public.admin_activity_logs (admin_id, admin_email, action, module, record_id, record_title, metadata)
   VALUES (
     target_user_id,
@@ -224,8 +248,15 @@ RETURNS TRIGGER AS $$
 DECLARE
   timeout_val NUMERIC;
 BEGIN
-  IF NOT public.is_admin() THEN
-    RAISE EXCEPTION 'Unauthorized: Only administrators can modify system settings.';
+  IF auth.uid() IS NOT NULL THEN
+    IF NOT public.is_admin() THEN
+      RAISE EXCEPTION 'Unauthorized: Only administrators can modify system settings.';
+    END IF;
+  ELSE
+    -- Trusted operator / migration execution
+    IF NOT (session_user IN ('postgres', 'supabase_admin') OR COALESCE(current_setting('request.jwt.claim.role', true), '') = 'service_role') THEN
+      RAISE EXCEPTION 'Unauthorized: Only administrators can modify system settings.';
+    END IF;
   END IF;
 
   IF NEW.key = 'session_timeout_minutes' THEN
@@ -245,6 +276,9 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+REVOKE ALL ON FUNCTION public.validate_admin_settings() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.validate_admin_settings() TO authenticated;
 
 DROP TRIGGER IF EXISTS tr_validate_admin_settings ON public.admin_settings;
 CREATE TRIGGER tr_validate_admin_settings
@@ -283,24 +317,42 @@ CREATE OR REPLACE FUNCTION public.stamp_activity_log()
 RETURNS TRIGGER AS $$
 DECLARE
   trusted_email TEXT;
+  caller_role TEXT;
 BEGIN
-  IF auth.uid() IS NULL THEN
-    RAISE EXCEPTION 'Audit error: Unauthorized activity log attempt without valid auth identity.';
+  IF auth.uid() IS NOT NULL THEN
+    -- Authenticated client call: strictly enforce caller's verified identity
+    NEW.admin_id := auth.uid();
+
+    -- Obtain verified email directly from auth.users, never editable profile
+    SELECT email INTO trusted_email FROM auth.users WHERE id = auth.uid();
+    IF trusted_email IS NULL THEN
+      trusted_email := COALESCE(auth.jwt() ->> 'email', 'authenticated_user');
+    END IF;
+
+    NEW.admin_email := trusted_email;
+  ELSE
+    -- Direct trusted operator call (SQL Editor / postgres / supabase_admin / service_role)
+    caller_role := COALESCE(current_setting('request.jwt.claim.role', true), '');
+    IF session_user IN ('postgres', 'supabase_admin') OR caller_role = 'service_role' THEN
+      -- Allow system / operator execution
+      IF NEW.admin_id IS NOT NULL AND (NEW.admin_email IS NULL OR NEW.admin_email = '') THEN
+        SELECT email INTO trusted_email FROM auth.users WHERE id = NEW.admin_id;
+        NEW.admin_email := COALESCE(trusted_email, 'system');
+      ELSIF NEW.admin_email IS NULL OR NEW.admin_email = '' THEN
+        NEW.admin_email := 'system';
+      END IF;
+    ELSE
+      RAISE EXCEPTION 'Audit error: Unauthorized activity log attempt without valid auth identity.';
+    END IF;
   END IF;
 
-  NEW.admin_id := auth.uid();
-
-  -- Obtain verified email directly from auth.users, never editable profile
-  SELECT email INTO trusted_email FROM auth.users WHERE id = auth.uid();
-  IF trusted_email IS NULL THEN
-    trusted_email := COALESCE(auth.jwt() ->> 'email', 'authenticated_user');
-  END IF;
-
-  NEW.admin_email := trusted_email;
   NEW.created_at := NOW();
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+REVOKE ALL ON FUNCTION public.stamp_activity_log() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.stamp_activity_log() TO authenticated;
 
 DROP TRIGGER IF EXISTS tr_stamp_activity_log ON public.admin_activity_logs;
 CREATE TRIGGER tr_stamp_activity_log

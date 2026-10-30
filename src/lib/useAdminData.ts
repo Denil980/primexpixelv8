@@ -1,5 +1,9 @@
-import { useState, useEffect, useMemo } from 'react';
+import { useState, useEffect, useMemo, useRef } from 'react';
 import { getCollection } from '../admin/db';
+import {
+  fetchPublicCollectionFromSupabase,
+  CollectionKey,
+} from '../admin/db/supabaseService';
 import {
   stats as defaultStats,
   workItems as defaultWorks,
@@ -22,34 +26,174 @@ import type {
 
 const DB_UPDATE_EVENT = 'primexpixel_db_updated';
 
-function useCollectionData<T>(collection: string, defaultData: T[]): T[] {
-  const [data, setData] = useState<T[]>(() => {
+// ----------------------------------------------------------------------------
+// Client-Side Cache & In-Flight Request Deduplication
+// ----------------------------------------------------------------------------
+interface CacheEntry {
+  data: any[];
+  timestamp: number;
+}
+
+const memoryCache: Partial<Record<CollectionKey, CacheEntry>> = {};
+const inFlightRequests = new Map<CollectionKey, Promise<any[]>>();
+const CACHE_TTL_MS = 30 * 1000; // 30 seconds TTL for public data
+
+export function clearPublicDataCache(collection?: CollectionKey) {
+  if (collection) {
+    delete memoryCache[collection];
+  } else {
+    for (const key of Object.keys(memoryCache)) {
+      delete memoryCache[key as CollectionKey];
+    }
+  }
+}
+
+/**
+ * Normalizes legacy collection keys
+ */
+function normalizeKey(col: string): CollectionKey {
+  if (col === 'reviewVideos') return 'videoReviews';
+  return col as CollectionKey;
+}
+
+/**
+ * Loads public collection from Supabase with request deduplication and memory caching.
+ */
+async function loadCollectionFromSupabaseWithCache(collection: CollectionKey): Promise<any[]> {
+  const cached = memoryCache[collection];
+  if (cached && Date.now() - cached.timestamp < CACHE_TTL_MS) {
+    return cached.data;
+  }
+
+  // Deduplicate concurrent requests for the exact same collection
+  if (inFlightRequests.has(collection)) {
+    return inFlightRequests.get(collection)!;
+  }
+
+  const promise = (async () => {
     try {
-      const items = getCollection(collection as any);
-      if (items && items.length > 0) return items as T[];
+      const items = await fetchPublicCollectionFromSupabase(collection);
+      if (Array.isArray(items) && items.length > 0) {
+        memoryCache[collection] = { data: items, timestamp: Date.now() };
+      }
+      return items;
+    } catch (err) {
+      console.warn(`[useAdminData] Error loading ${collection} from Supabase:`, err);
+      return [];
+    } finally {
+      inFlightRequests.delete(collection);
+    }
+  })();
+
+  inFlightRequests.set(collection, promise);
+  return promise;
+}
+
+export interface CollectionState<T> {
+  data: T[];
+  loading: boolean;
+  error: Error | null;
+  isEmpty: boolean;
+  fromDatabase: boolean;
+}
+
+export function useLiveCollectionState<T>(
+  rawCollection: string,
+  defaultData: T[]
+): CollectionState<T> {
+  const collection = normalizeKey(rawCollection);
+
+  const [data, setData] = useState<T[]>(() => {
+    const cached = memoryCache[collection];
+    if (cached && cached.data.length > 0) return cached.data as T[];
+    try {
+      const localItems = getCollection(collection as any);
+      if (localItems && localItems.length > 0) return localItems as T[];
     } catch {}
     return defaultData;
   });
 
+  const [loading, setLoading] = useState<boolean>(() => {
+    const cached = memoryCache[collection];
+    return !cached || cached.data.length === 0;
+  });
+
+  const [error, setError] = useState<Error | null>(null);
+  const [fromDatabase, setFromDatabase] = useState<boolean>(() => {
+    const cached = memoryCache[collection];
+    return Boolean(cached && cached.data.length > 0);
+  });
+
+  const isMountedRef = useRef(true);
+
   useEffect(() => {
-    const update = () => {
+    isMountedRef.current = true;
+
+    const fetchLive = async (forceBustCache = false) => {
+      if (forceBustCache) {
+        delete memoryCache[collection];
+      }
+
       try {
-        const items = getCollection(collection as any);
-        if (items && items.length > 0) {
-          setData(items as T[]);
+        const dbItems = await loadCollectionFromSupabaseWithCache(collection);
+        if (!isMountedRef.current) return;
+
+        if (Array.isArray(dbItems) && dbItems.length > 0) {
+          setData(dbItems as T[]);
+          setFromDatabase(true);
+        } else {
+          // If database is empty, maintain fallback
+          setFromDatabase(false);
+          try {
+            const localItems = getCollection(collection as any);
+            if (localItems && localItems.length > 0) {
+              setData(localItems as T[]);
+            } else {
+              setData(defaultData);
+            }
+          } catch {
+            setData(defaultData);
+          }
         }
-      } catch {}
+        setError(null);
+      } catch (err: any) {
+        if (!isMountedRef.current) return;
+        console.warn(`[useAdminData] Fallback preserved for ${collection}:`, err);
+        setError(err instanceof Error ? err : new Error(String(err)));
+      } finally {
+        if (isMountedRef.current) {
+          setLoading(false);
+        }
+      }
     };
 
-    window.addEventListener(DB_UPDATE_EVENT, update);
-    window.addEventListener('storage', update);
+    fetchLive();
+
+    const handleUpdate = () => {
+      fetchLive(true);
+    };
+
+    window.addEventListener(DB_UPDATE_EVENT, handleUpdate);
+    window.addEventListener('storage', handleUpdate);
 
     return () => {
-      window.removeEventListener(DB_UPDATE_EVENT, update);
-      window.removeEventListener('storage', update);
+      isMountedRef.current = false;
+      window.removeEventListener(DB_UPDATE_EVENT, handleUpdate);
+      window.removeEventListener('storage', handleUpdate);
     };
-  }, [collection]);
+  }, [collection, defaultData]);
 
+  return {
+    data,
+    loading,
+    error,
+    isEmpty: data.length === 0,
+    fromDatabase,
+  };
+}
+
+function useCollectionData<T>(collection: string, defaultData: T[]): T[] {
+  const { data } = useLiveCollectionState<T>(collection, defaultData);
   return data;
 }
 
@@ -96,9 +240,10 @@ export function useLiveSiteNumbers(locationPrefix?: string) {
   }, [items, locationPrefix]);
 }
 
-export function useLiveWorks() {
-  const items = useCollectionData<AdminWorkItem>('works', []);
-  return useMemo(() => {
+export function useLiveWorksWithState() {
+  const state = useLiveCollectionState<AdminWorkItem>('works', []);
+  const works = useMemo(() => {
+    const items = state.data;
     if (!items || items.length === 0) {
       return defaultWorks;
     }
@@ -121,17 +266,32 @@ export function useLiveWorks() {
           gallery: w.gallery || [],
         },
       }));
-  }, [items]);
+  }, [state.data]);
+
+  return { ...state, data: works };
 }
 
-export function useLiveServices() {
-  const items = useCollectionData<AdminService>('services', []);
-  return useMemo(() => {
+export function useLiveWorks() {
+  const { data } = useLiveWorksWithState();
+  return data;
+}
+
+export function useLiveServicesWithState() {
+  const state = useLiveCollectionState<AdminService>('services', []);
+  const services = useMemo(() => {
+    const items = state.data;
     if (!items || items.length === 0) {
       return defaultServices;
     }
     return items.filter((s) => s.show).sort((a, b) => a.order - b.order);
-  }, [items]);
+  }, [state.data]);
+
+  return { ...state, data: services };
+}
+
+export function useLiveServices() {
+  const { data } = useLiveServicesWithState();
+  return data;
 }
 
 export function useLiveProcessSteps() {
@@ -170,9 +330,10 @@ export function useLiveFAQs() {
   }, [items]);
 }
 
-export function useLiveBlogs() {
-  const items = useCollectionData<AdminBlogPost>('blogs', []);
-  return useMemo(() => {
+export function useLiveBlogsWithState() {
+  const state = useLiveCollectionState<AdminBlogPost>('blogs', []);
+  const blogs = useMemo(() => {
+    const items = state.data;
     if (!items || items.length === 0) {
       return defaultBlogs;
     }
@@ -196,7 +357,14 @@ export function useLiveBlogs() {
         hue: b.hue || '#0582D5',
         iso: b.publishDate ? new Date(b.publishDate).toISOString() : new Date().toISOString(),
       }));
-  }, [items]);
+  }, [state.data]);
+
+  return { ...state, data: blogs };
+}
+
+export function useLiveBlogs() {
+  const { data } = useLiveBlogsWithState();
+  return data;
 }
 
 export function useLiveReviews() {
