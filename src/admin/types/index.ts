@@ -62,6 +62,10 @@ export interface AdminWorkItem {
   coverImage: string;
   gallery: string[];
   description: string;
+  overview?: string;
+  features?: string[];
+  highlights?: string[];
+  resultsList?: string[];
   challenge?: string;
   approach?: string;
   outcome?: string;

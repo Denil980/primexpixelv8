@@ -177,9 +177,9 @@ export default function WorkDetail() {
             )}
 
             {/* Full gallery */}
-            {d?.gallery?.length ? (
+            {(d?.gallery?.length || item.gallery?.length) ? (
               <section className="reveal space-y-6">
-                {d.gallery.map((src: string) => (
+                {((d?.gallery?.length ? d.gallery : item.gallery) as string[]).map((src: string) => (
                   <div key={src} className="overflow-hidden rounded-[1.5rem] border border-[var(--border)] shadow-premium">
                     <img src={src} alt={`${item.title} showcase`} loading="lazy" className="w-full object-cover" />
                   </div>

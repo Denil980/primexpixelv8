@@ -138,6 +138,34 @@ export function mapVideoReviewToDB(item: Partial<AdminVideoReview>): any {
 
 // 4. WORKS (PORTFOLIO)
 export function mapWorkFromDB(row: any): AdminWorkItem {
+  // If results is an object, extract fallback if dedicated columns not yet migrated
+  const resultsMeta = typeof row.results === 'object' && row.results !== null && !Array.isArray(row.results)
+    ? row.results
+    : null;
+  const metrics = Array.isArray(row.results)
+    ? row.results
+    : Array.isArray(resultsMeta?.metrics)
+    ? resultsMeta.metrics
+    : [];
+
+  const features = Array.isArray(row.features) && row.features.length > 0
+    ? row.features
+    : Array.isArray(resultsMeta?.features)
+    ? resultsMeta.features
+    : [];
+
+  const highlights = Array.isArray(row.highlights) && row.highlights.length > 0
+    ? row.highlights
+    : Array.isArray(resultsMeta?.highlights)
+    ? resultsMeta.highlights
+    : [];
+
+  const resultsList = Array.isArray(row.results_list) && row.results_list.length > 0
+    ? row.results_list
+    : Array.isArray(resultsMeta?.resultsList)
+    ? resultsMeta.resultsList
+    : [];
+
   return {
     id: row.id,
     title: row.title || '',
@@ -147,13 +175,17 @@ export function mapWorkFromDB(row: any): AdminWorkItem {
     coverImage: row.cover_image || '',
     gallery: Array.isArray(row.gallery) ? row.gallery : [],
     description: row.description || '',
+    overview: row.overview || resultsMeta?.overview || row.description || '',
+    features,
+    highlights,
+    resultsList,
     challenge: row.challenge || '',
     approach: row.approach || '',
     outcome: row.outcome || '',
     liveLink: row.live_link || '',
     tech: Array.isArray(row.tech) ? row.tech : [],
     year: row.year || '',
-    results: Array.isArray(row.results) ? row.results : [],
+    results: metrics,
     show: Boolean(row.is_visible),
     order: Number(row.display_order) || 0,
     updatedAt: row.updated_at || new Date().toISOString(),
@@ -170,6 +202,10 @@ export function mapWorkToDB(item: Partial<AdminWorkItem>): any {
   if (item.coverImage !== undefined) row.cover_image = item.coverImage;
   if (item.gallery !== undefined) row.gallery = item.gallery;
   if (item.description !== undefined) row.description = item.description;
+  if (item.overview !== undefined) row.overview = item.overview;
+  if (item.features !== undefined) row.features = item.features;
+  if (item.highlights !== undefined) row.highlights = item.highlights;
+  if (item.resultsList !== undefined) row.results_list = item.resultsList;
   if (item.challenge !== undefined) row.challenge = item.challenge;
   if (item.approach !== undefined) row.approach = item.approach;
   if (item.outcome !== undefined) row.outcome = item.outcome;
@@ -404,11 +440,45 @@ export async function createItemInSupabase(collection: CollectionKey, item: any)
   const dbRow = mapItemToDB(collection, item);
 
   // If no ID is provided, Supabase default gen_random_uuid() handles it
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from(tableName)
     .insert([dbRow])
     .select()
     .single();
+
+  // Graceful fallback for 'works' if migration 20261030000003 has not been run yet
+  const isMissingColumnError =
+    error &&
+    collection === 'works' &&
+    (error.code === 'PGRST204' ||
+      (error.message?.includes('column') &&
+        (error.message?.includes('schema cache') ||
+          error.message?.includes('Could not find') ||
+          error.message?.includes('does not exist'))));
+
+  if (isMissingColumnError) {
+    console.warn('[Supabase Works] Table lacks new columns. Falling back to JSONB encoding in results.');
+    const fallbackRow = { ...dbRow };
+    fallbackRow.results = {
+      metrics: item.results || [],
+      overview: item.overview || '',
+      features: item.features || [],
+      highlights: item.highlights || [],
+      resultsList: item.resultsList || [],
+    };
+    delete fallbackRow.overview;
+    delete fallbackRow.features;
+    delete fallbackRow.highlights;
+    delete fallbackRow.results_list;
+
+    const retry = await supabase
+      .from(tableName)
+      .insert([fallbackRow])
+      .select()
+      .single();
+    data = retry.data;
+    error = retry.error;
+  }
 
   if (error) {
     console.error(`[Supabase] Error creating item in ${collection}:`, error.message);
@@ -424,12 +494,47 @@ export async function updateItemInSupabase(collection: CollectionKey, id: string
   const dbRow = mapItemToDB(collection, updates);
   delete dbRow.id; // Do not attempt to update the primary key
 
-  const { data, error } = await supabase
+  let { data, error } = await supabase
     .from(tableName)
     .update(dbRow)
     .eq('id', id)
     .select()
     .single();
+
+  // Graceful fallback for 'works' if migration 20261030000003 has not been run yet
+  const isMissingColumnError =
+    error &&
+    collection === 'works' &&
+    (error.code === 'PGRST204' ||
+      (error.message?.includes('column') &&
+        (error.message?.includes('schema cache') ||
+          error.message?.includes('Could not find') ||
+          error.message?.includes('does not exist'))));
+
+  if (isMissingColumnError) {
+    console.warn('[Supabase Works] Table lacks new columns. Falling back to JSONB encoding in results.');
+    const fallbackRow = { ...dbRow };
+    fallbackRow.results = {
+      metrics: updates.results || [],
+      overview: updates.overview || '',
+      features: updates.features || [],
+      highlights: updates.highlights || [],
+      resultsList: updates.resultsList || [],
+    };
+    delete fallbackRow.overview;
+    delete fallbackRow.features;
+    delete fallbackRow.highlights;
+    delete fallbackRow.results_list;
+
+    const retry = await supabase
+      .from(tableName)
+      .update(fallbackRow)
+      .eq('id', id)
+      .select()
+      .single();
+    data = retry.data;
+    error = retry.error;
+  }
 
   if (error) {
     console.error(`[Supabase] Error updating item ${id} in ${collection}:`, error.message);
