@@ -1,10 +1,12 @@
 -- ============================================================================
 -- PrimeXPixel Database Schema Migration
--- Migration 00001: Initial Schema, RLS Policies, and Triggers
+-- Migration 00001: Complete Schema, RLS Policies, Activity Logs & Triggers
 -- Compatible with PostgreSQL 15+ / Supabase
 -- ============================================================================
 
+-- ----------------------------------------------------------------------------
 -- 1. Helper Function: Automatically update updated_at timestamp
+-- ----------------------------------------------------------------------------
 CREATE OR REPLACE FUNCTION public.handle_updated_at()
 RETURNS TRIGGER AS $$
 BEGIN
@@ -21,16 +23,17 @@ CREATE TABLE IF NOT EXISTS public.admin_users (
   email TEXT NOT NULL UNIQUE,
   full_name TEXT,
   role TEXT NOT NULL DEFAULT 'admin' CHECK (role IN ('owner', 'admin', 'editor')),
+  theme_preference TEXT DEFAULT 'system' CHECK (theme_preference IN ('dark', 'light', 'system')),
   created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Trigger for admin_users
+-- Trigger for admin_users updated_at
 CREATE OR REPLACE TRIGGER tr_admin_users_updated_at
   BEFORE UPDATE ON public.admin_users
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
--- Security function to verify if the current request is from an authorized admin
+-- Security helper: check if requesting user is an authorized admin
 CREATE OR REPLACE FUNCTION public.is_admin()
 RETURNS BOOLEAN AS $$
 BEGIN
@@ -43,8 +46,79 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
 
+-- Security helper: check if requesting user is an owner
+CREATE OR REPLACE FUNCTION public.is_owner()
+RETURNS BOOLEAN AS $$
+BEGIN
+  RETURN (
+    EXISTS (
+      SELECT 1 FROM public.admin_users
+      WHERE id = auth.uid() AND role = 'owner'
+    )
+  );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+-- Prevent role self-escalation: only owners can change roles
+CREATE OR REPLACE FUNCTION public.check_admin_role_escalation()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF (TG_OP = 'UPDATE' AND OLD.role IS DISTINCT FROM NEW.role) THEN
+    IF NOT public.is_owner() THEN
+      RAISE EXCEPTION 'Unauthorized: Only owners can modify administrator roles';
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+CREATE OR REPLACE TRIGGER tr_check_admin_role_escalation
+  BEFORE UPDATE ON public.admin_users
+  FOR EACH ROW EXECUTE FUNCTION public.check_admin_role_escalation();
+
 -- ----------------------------------------------------------------------------
--- 3. Module 1: Blogs (Articles & Insights)
+-- 3. System & Admin Settings Table
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.admin_settings (
+  key TEXT PRIMARY KEY,
+  value JSONB NOT NULL,
+  description TEXT,
+  updated_by UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE OR REPLACE TRIGGER tr_admin_settings_updated_at
+  BEFORE UPDATE ON public.admin_settings
+  FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
+
+-- Seed default settings
+INSERT INTO public.admin_settings (key, value, description)
+VALUES 
+  ('session_timeout_minutes', '60'::jsonb, 'Admin session inactivity timeout in minutes'),
+  ('backup_retention_days', '30'::jsonb, 'Automatic backup retention period')
+ON CONFLICT (key) DO NOTHING;
+
+-- ----------------------------------------------------------------------------
+-- 4. Activity Logs (Audit Trail)
+-- ----------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS public.admin_activity_logs (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  admin_id UUID REFERENCES auth.users(id) ON DELETE SET NULL,
+  admin_email TEXT NOT NULL,
+  action TEXT NOT NULL, -- 'login', 'logout', 'create', 'update', 'delete', 'publish', 'unpublish', 'backup_export', 'backup_restore', 'reset_defaults', 'settings_update'
+  module TEXT NOT NULL, -- 'blogs', 'reviews', 'works', 'services', 'process', 'faqs', 'site_numbers', 'settings', 'auth'
+  record_id TEXT,
+  record_title TEXT,
+  metadata JSONB NOT NULL DEFAULT '{}'::jsonb, -- Safe metadata (e.g. diff, counts). Never passwords or tokens.
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON public.admin_activity_logs(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_module ON public.admin_activity_logs(module);
+CREATE INDEX IF NOT EXISTS idx_activity_logs_admin ON public.admin_activity_logs(admin_id);
+
+-- ----------------------------------------------------------------------------
+-- 5. Module 1: Blogs (Articles & Insights)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.blogs (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -76,7 +150,7 @@ CREATE OR REPLACE TRIGGER tr_blogs_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 4. Module 2: Client Reviews (Text Testimonials)
+-- 6. Module 2: Client Reviews (Text Testimonials)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.reviews (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -102,7 +176,7 @@ CREATE OR REPLACE TRIGGER tr_reviews_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 5. Module 3: Video Reviews
+-- 7. Module 3: Video Reviews
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.video_reviews (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -126,7 +200,7 @@ CREATE OR REPLACE TRIGGER tr_video_reviews_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 6. Module 4: Our Works (Portfolio Case Studies)
+-- 8. Module 4: Our Works (Portfolio Case Studies)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.works (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -159,7 +233,7 @@ CREATE OR REPLACE TRIGGER tr_works_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 7. Module 5: Services (With Zero-Pricing Architecture)
+-- 9. Module 5: Services (With Zero-Pricing Architecture)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.services (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -199,7 +273,7 @@ CREATE OR REPLACE TRIGGER tr_services_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 8. Module 6: Our Process (Step-by-step Timeline)
+-- 10. Module 6: Our Process (Step-by-step Timeline)
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.process_steps (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -221,7 +295,7 @@ CREATE OR REPLACE TRIGGER tr_process_steps_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 9. Module 7: FAQs
+-- 11. Module 7: FAQs
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.faqs (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -242,7 +316,7 @@ CREATE OR REPLACE TRIGGER tr_faqs_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 10. Module 8: Site Numbers / Statistics
+-- 12. Module 8: Site Numbers / Statistics
 -- ----------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS public.site_numbers (
   id TEXT PRIMARY KEY DEFAULT gen_random_uuid()::text,
@@ -264,12 +338,49 @@ CREATE OR REPLACE TRIGGER tr_site_numbers_updated_at
   BEFORE UPDATE ON public.site_numbers
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
+-- ----------------------------------------------------------------------------
+-- 13. High-Performance Dashboard & Sidebar Statistics Function
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE FUNCTION public.get_admin_dashboard_counts()
+RETURNS JSONB AS $$
+DECLARE
+  counts JSONB;
+BEGIN
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Unauthorized: Access restricted to administrators';
+  END IF;
+
+  SELECT jsonb_build_object(
+    'blogs_total', (SELECT COUNT(*) FROM public.blogs),
+    'blogs_published', (SELECT COUNT(*) FROM public.blogs WHERE status = 'published'),
+    'blogs_draft', (SELECT COUNT(*) FROM public.blogs WHERE status = 'draft'),
+    'works_total', (SELECT COUNT(*) FROM public.works),
+    'works_visible', (SELECT COUNT(*) FROM public.works WHERE is_visible = true),
+    'services_total', (SELECT COUNT(*) FROM public.services),
+    'services_visible', (SELECT COUNT(*) FROM public.services WHERE is_visible = true),
+    'reviews_total', (SELECT COUNT(*) FROM public.reviews),
+    'reviews_visible', (SELECT COUNT(*) FROM public.reviews WHERE is_visible = true),
+    'video_reviews_total', (SELECT COUNT(*) FROM public.video_reviews),
+    'video_reviews_visible', (SELECT COUNT(*) FROM public.video_reviews WHERE is_visible = true),
+    'process_total', (SELECT COUNT(*) FROM public.process_steps),
+    'process_visible', (SELECT COUNT(*) FROM public.process_steps WHERE is_visible = true),
+    'faqs_total', (SELECT COUNT(*) FROM public.faqs),
+    'faqs_visible', (SELECT COUNT(*) FROM public.faqs WHERE is_visible = true),
+    'site_numbers_total', (SELECT COUNT(*) FROM public.site_numbers),
+    'site_numbers_visible', (SELECT COUNT(*) FROM public.site_numbers WHERE is_visible = true)
+  ) INTO counts;
+
+  RETURN counts;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
 -- ============================================================================
--- 11. Row Level Security (RLS) Enablement & Policies
+-- 14. Row Level Security (RLS) Enablement & Policies
 -- ============================================================================
 
--- Enable RLS on all tables
 ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_settings ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.admin_activity_logs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.blogs ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.reviews ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.video_reviews ENABLE ROW LEVEL SECURITY;
@@ -288,34 +399,56 @@ CREATE POLICY "Admins can view admin list"
   TO authenticated
   USING (public.is_admin() OR auth.uid() = id);
 
-CREATE POLICY "Owners can manage admin users"
+CREATE POLICY "Owners can insert or update admin users"
   ON public.admin_users
   FOR ALL
   TO authenticated
-  USING (
-    EXISTS (
-      SELECT 1 FROM public.admin_users
-      WHERE id = auth.uid() AND role = 'owner'
-    )
-  )
-  WITH CHECK (
-    EXISTS (
-      SELECT 1 FROM public.admin_users
-      WHERE id = auth.uid() AND role = 'owner'
-    )
-  );
+  USING (public.is_owner() OR auth.uid() = id)
+  WITH CHECK (public.is_owner() OR auth.uid() = id);
+
+-- ----------------------------------------------------------------------------
+-- Policies for admin_settings
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Admins can view settings"
+  ON public.admin_settings
+  FOR SELECT
+  TO authenticated
+  USING (public.is_admin());
+
+CREATE POLICY "Admins can update settings"
+  ON public.admin_settings
+  FOR UPDATE
+  TO authenticated
+  USING (public.is_admin())
+  WITH CHECK (public.is_admin());
+
+-- ----------------------------------------------------------------------------
+-- Policies for admin_activity_logs (Append-Only Immutable Audit Trail)
+-- ----------------------------------------------------------------------------
+CREATE POLICY "Admins can view activity logs"
+  ON public.admin_activity_logs
+  FOR SELECT
+  TO authenticated
+  USING (public.is_admin());
+
+CREATE POLICY "Admins can insert activity logs"
+  ON public.admin_activity_logs
+  FOR INSERT
+  TO authenticated
+  WITH CHECK (public.is_admin());
+
+-- Note: No UPDATE or DELETE policies are defined for admin_activity_logs,
+-- ensuring logs remain strictly immutable and tamper-resistant.
 
 -- ----------------------------------------------------------------------------
 -- Policies for blogs
 -- ----------------------------------------------------------------------------
--- Public: can read published articles only
 CREATE POLICY "Public can view published blogs"
   ON public.blogs
   FOR SELECT
   TO anon, authenticated
   USING (status = 'published');
 
--- Admins: full CRUD access
 CREATE POLICY "Admins have full access to blogs"
   ON public.blogs
   FOR ALL
@@ -434,21 +567,3 @@ CREATE POLICY "Admins have full access to site numbers"
   TO authenticated
   USING (public.is_admin())
   WITH CHECK (public.is_admin());
-
--- ----------------------------------------------------------------------------
--- 12. Storage Bucket Configuration (SQL blueprint for later execution)
--- ----------------------------------------------------------------------------
--- INSERT INTO storage.buckets (id, name, public) VALUES ('media', 'media', true)
--- ON CONFLICT (id) DO NOTHING;
---
--- CREATE POLICY "Public Access" ON storage.objects
---   FOR SELECT TO anon, authenticated USING (bucket_id = 'media');
---
--- CREATE POLICY "Admin Upload Access" ON storage.objects
---   FOR INSERT TO authenticated WITH CHECK (bucket_id = 'media' AND public.is_admin());
---
--- CREATE POLICY "Admin Update Access" ON storage.objects
---   FOR UPDATE TO authenticated USING (bucket_id = 'media' AND public.is_admin());
---
--- CREATE POLICY "Admin Delete Access" ON storage.objects
---   FOR DELETE TO authenticated USING (bucket_id = 'media' AND public.is_admin());
