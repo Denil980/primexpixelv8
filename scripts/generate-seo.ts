@@ -246,6 +246,34 @@ for (const r of routes) {
   written++;
 }
 
+// ---- Static Admin Entry Points ------------------------------------------------
+// Pre-generate physical entry files for /admin routes so Vercel and static web
+// servers instantly serve index.html on direct URL navigation and refresh.
+const adminRoutes = [
+  'admin',
+  'admin/login',
+  'admin/blogs',
+  'admin/reviews',
+  'admin/video-reviews',
+  'admin/works',
+  'admin/services',
+  'admin/process',
+  'admin/faqs',
+  'admin/site-numbers',
+  'admin/media',
+  'admin/settings',
+];
+
+const adminHtml = template
+  .replace(/<title>.*?<\/title>/, '<title>Admin Panel — PrimeXPixel</title>')
+  .replace(/<meta name="robots" content=".*?" \/>/, '<meta name="robots" content="noindex, nofollow" />');
+
+for (const adminRoute of adminRoutes) {
+  const dir = path.join(DIST, adminRoute);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'index.html'), adminHtml, 'utf-8');
+}
+
 // ---- Sitemap ------------------------------------------------------------------
 const today = new Date().toISOString().slice(0, 10);
 const sitemap = `<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n${routes

@@ -66,6 +66,7 @@ function AnimatedRoutes() {
   if (isAdmin) {
     return (
       <Routes>
+        <Route path="/admin" element={<AdminApp />} />
         <Route path="/admin/*" element={<AdminApp />} />
       </Routes>
     );
