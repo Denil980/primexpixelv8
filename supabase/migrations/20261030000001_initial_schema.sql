@@ -1,8 +1,9 @@
 -- ============================================================================
 -- PrimeXPixel Database Schema Migration
 -- Migration: 20261030000001_initial_schema.sql
--- Description: Complete Production-Grade Schema, Hardened RLS, Activity Logs,
---              Role Escalation Protection, and Dashboard RPCs
+-- Description: Hardened Production Schema, Tamper-Resistant Audit Logs,
+--              Concurrency-Safe Owner Protection, Validated Settings,
+--              and Secure First-Owner Provisioning
 -- Target: PostgreSQL 15+ / Supabase
 -- ============================================================================
 
@@ -18,6 +19,9 @@ BEGIN
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+REVOKE ALL ON FUNCTION public.handle_updated_at() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.handle_updated_at() TO authenticated;
 
 -- ----------------------------------------------------------------------------
 -- 2. ADMIN PROFILES & ACCESS CONTROL
@@ -51,6 +55,9 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
+REVOKE ALL ON FUNCTION public.is_admin() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_admin() TO anon, authenticated;
+
 -- Helper: verify if requesting user has owner role
 CREATE OR REPLACE FUNCTION public.is_owner()
 RETURNS BOOLEAN AS $$
@@ -64,42 +71,67 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
--- Guard: Prevent non-owners from modifying roles (anti-privilege escalation)
-CREATE OR REPLACE FUNCTION public.check_admin_role_escalation()
+REVOKE ALL ON FUNCTION public.is_owner() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION public.is_owner() TO anon, authenticated;
+
+-- Guard & Sync: Protect email, id, and role modifications while syncing email with auth.users
+CREATE OR REPLACE FUNCTION public.sync_and_protect_admin_user()
 RETURNS TRIGGER AS $$
+DECLARE
+  verified_auth_email TEXT;
 BEGIN
-  IF (TG_OP = 'UPDATE' AND OLD.role IS DISTINCT FROM NEW.role) THEN
+  -- Synchronize email directly from trusted auth.users identity
+  SELECT email INTO verified_auth_email FROM auth.users WHERE id = NEW.id;
+  IF verified_auth_email IS NOT NULL THEN
+    NEW.email := verified_auth_email;
+  END IF;
+
+  -- Guard modifications on UPDATE
+  IF TG_OP = 'UPDATE' THEN
     IF NOT public.is_owner() THEN
-      RAISE EXCEPTION 'Unauthorized: Only owners can modify administrator roles';
+      -- Non-owners cannot change role
+      IF OLD.role IS DISTINCT FROM NEW.role THEN
+        RAISE EXCEPTION 'Unauthorized: Non-owners cannot alter administrator role permissions.';
+      END IF;
+      -- Non-owners cannot change id or email identity
+      IF OLD.id <> NEW.id OR OLD.email IS DISTINCT FROM NEW.email THEN
+        RAISE EXCEPTION 'Unauthorized: Account ID and email identity cannot be altered directly.';
+      END IF;
     END IF;
   END IF;
+
   RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
-DROP TRIGGER IF EXISTS tr_check_admin_role_escalation ON public.admin_users;
-CREATE TRIGGER tr_check_admin_role_escalation
-  BEFORE UPDATE ON public.admin_users
-  FOR EACH ROW EXECUTE FUNCTION public.check_admin_role_escalation();
+DROP TRIGGER IF EXISTS tr_sync_and_protect_admin_user ON public.admin_users;
+CREATE TRIGGER tr_sync_and_protect_admin_user
+  BEFORE INSERT OR UPDATE ON public.admin_users
+  FOR EACH ROW EXECUTE FUNCTION public.sync_and_protect_admin_user();
 
--- Guard: Prevent deleting or demoting the last remaining owner
+-- Guard: Concurrency-safe protection preventing removal or demotion of the last remaining owner
 CREATE OR REPLACE FUNCTION public.protect_last_owner()
 RETURNS TRIGGER AS $$
+DECLARE
+  owner_count INTEGER;
 BEGIN
-  IF (TG_OP = 'DELETE' AND OLD.role = 'owner') THEN
-    IF (SELECT COUNT(*) FROM public.admin_users WHERE role = 'owner') <= 1 THEN
-      RAISE EXCEPTION 'Operation rejected: Cannot delete the only remaining owner account.';
+  IF (TG_OP = 'DELETE' AND OLD.role = 'owner') OR 
+     (TG_OP = 'UPDATE' AND OLD.role = 'owner' AND NEW.role <> 'owner') THEN
+    -- Serialize concurrent owner changes using row-level locking
+    PERFORM 1 FROM public.admin_users WHERE role = 'owner' FOR UPDATE;
+    
+    SELECT COUNT(*) INTO owner_count FROM public.admin_users WHERE role = 'owner';
+    
+    IF owner_count <= 1 THEN
+      RAISE EXCEPTION 'Operation rejected: Cannot delete or demote the only remaining owner account (concurrency-safe check).';
     END IF;
+  END IF;
+
+  IF TG_OP = 'DELETE' THEN
     RETURN OLD;
+  ELSE
+    RETURN NEW;
   END IF;
-
-  IF (TG_OP = 'UPDATE' AND OLD.role = 'owner' AND NEW.role <> 'owner') THEN
-    IF (SELECT COUNT(*) FROM public.admin_users WHERE role = 'owner') <= 1 THEN
-      RAISE EXCEPTION 'Operation rejected: Cannot demote the only remaining owner account.';
-    END IF;
-  END IF;
-
-  RETURN NEW;
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
@@ -109,7 +141,65 @@ CREATE TRIGGER tr_protect_last_owner
   FOR EACH ROW EXECUTE FUNCTION public.protect_last_owner();
 
 -- ----------------------------------------------------------------------------
--- 3. SYSTEM & ADMIN SETTINGS
+-- 3. SECURE FIRST-OWNER BOOTSTRAP PROCEDURE
+-- ----------------------------------------------------------------------------
+
+-- Controlled, one-time server-side procedure to provision the initial owner.
+-- Permanently disables itself once an owner exists.
+CREATE OR REPLACE FUNCTION public.provision_initial_owner(owner_full_name TEXT DEFAULT 'PrimeXPixel Owner')
+RETURNS JSONB AS $$
+DECLARE
+  current_user_id UUID;
+  current_user_email TEXT;
+  existing_count INTEGER;
+  new_admin public.admin_users;
+BEGIN
+  current_user_id := auth.uid();
+  IF current_user_id IS NULL THEN
+    RAISE EXCEPTION 'Authentication required: User must be signed in to invoke owner provisioning.';
+  END IF;
+
+  SELECT email INTO current_user_email FROM auth.users WHERE id = current_user_id;
+  IF current_user_email IS NULL THEN
+    RAISE EXCEPTION 'User email not found in verified authentication records.';
+  END IF;
+
+  -- Atomic check: ensure no admin or owner currently exists
+  SELECT COUNT(*) INTO existing_count FROM public.admin_users;
+  IF existing_count > 0 THEN
+    RAISE EXCEPTION 'Bootstrap unavailable: An initial owner has already been provisioned for this system.';
+  END IF;
+
+  INSERT INTO public.admin_users (id, email, full_name, role, theme_preference)
+  VALUES (current_user_id, current_user_email, owner_full_name, 'owner', 'system')
+  RETURNING * INTO new_admin;
+
+  -- Record audit log of the bootstrap event
+  INSERT INTO public.admin_activity_logs (admin_id, admin_email, action, module, record_id, record_title, metadata)
+  VALUES (
+    current_user_id,
+    current_user_email,
+    'bootstrap_owner',
+    'auth',
+    current_user_id::text,
+    current_user_email,
+    jsonb_build_object('event', 'Initial owner account successfully provisioned')
+  );
+
+  RETURN jsonb_build_object(
+    'success', true,
+    'message', 'Initial owner provisioned successfully',
+    'email', current_user_email,
+    'role', 'owner'
+  );
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
+
+REVOKE ALL ON FUNCTION public.provision_initial_owner(TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION public.provision_initial_owner(TEXT) TO authenticated;
+
+-- ----------------------------------------------------------------------------
+-- 4. SYSTEM & ADMIN SETTINGS
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.admin_settings (
@@ -123,13 +213,25 @@ CREATE TABLE IF NOT EXISTS public.admin_settings (
 -- Validation trigger for admin settings
 CREATE OR REPLACE FUNCTION public.validate_admin_settings()
 RETURNS TRIGGER AS $$
+DECLARE
+  timeout_val NUMERIC;
 BEGIN
-  -- Validate session_timeout_minutes (between 5 and 1440 mins / 24h)
+  IF NOT public.is_admin() THEN
+    RAISE EXCEPTION 'Unauthorized: Only administrators can modify system settings.';
+  END IF;
+
   IF NEW.key = 'session_timeout_minutes' THEN
-    IF (NEW.value::text)::numeric < 5 OR (NEW.value::text)::numeric > 1440 THEN
-      RAISE EXCEPTION 'Session timeout must be between 5 and 1440 minutes.';
+    -- Validate that value is not null and is a valid JSON number
+    IF NEW.value IS NULL OR jsonb_typeof(NEW.value) <> 'number' THEN
+      RAISE EXCEPTION 'Invalid session timeout: Value must be a valid numeric JSON value.';
+    END IF;
+
+    timeout_val := (NEW.value)::text::numeric;
+    IF timeout_val < 5 OR timeout_val > 1440 THEN
+      RAISE EXCEPTION 'Session timeout out of bounds: Must be between 5 and 1440 minutes (24 hours).';
     END IF;
   END IF;
+
   NEW.updated_by := auth.uid();
   NEW.updated_at := NOW();
   RETURN NEW;
@@ -149,7 +251,7 @@ VALUES
 ON CONFLICT (key) DO NOTHING;
 
 -- ----------------------------------------------------------------------------
--- 4. ACTIVITY LOGS (Immutable Audit Trail)
+-- 5. ACTIVITY LOGS (Immutable Audit Trail)
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.admin_activity_logs (
@@ -168,18 +270,25 @@ CREATE INDEX IF NOT EXISTS idx_activity_logs_created ON public.admin_activity_lo
 CREATE INDEX IF NOT EXISTS idx_activity_logs_module ON public.admin_activity_logs(module);
 CREATE INDEX IF NOT EXISTS idx_activity_logs_admin ON public.admin_activity_logs(admin_id);
 
--- Enforce unforgeable audit logging: stamps caller's verified auth identity
+-- Enforce unforgeable audit logging: stamps caller's verified auth identity from auth.users
 CREATE OR REPLACE FUNCTION public.stamp_activity_log()
 RETURNS TRIGGER AS $$
+DECLARE
+  trusted_email TEXT;
 BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Audit error: Unauthorized activity log attempt without valid auth identity.';
+  END IF;
+
   NEW.admin_id := auth.uid();
-  SELECT email INTO NEW.admin_email FROM public.admin_users WHERE id = auth.uid();
-  IF NEW.admin_email IS NULL THEN
-    SELECT email INTO NEW.admin_email FROM auth.users WHERE id = auth.uid();
+
+  -- Obtain verified email directly from auth.users, never editable profile
+  SELECT email INTO trusted_email FROM auth.users WHERE id = auth.uid();
+  IF trusted_email IS NULL THEN
+    trusted_email := COALESCE(auth.jwt() ->> 'email', 'authenticated_user');
   END IF;
-  IF NEW.admin_email IS NULL THEN
-    NEW.admin_email := 'system';
-  END IF;
+
+  NEW.admin_email := trusted_email;
   NEW.created_at := NOW();
   RETURN NEW;
 END;
@@ -191,7 +300,7 @@ CREATE TRIGGER tr_stamp_activity_log
   FOR EACH ROW EXECUTE FUNCTION public.stamp_activity_log();
 
 -- ----------------------------------------------------------------------------
--- 5. MODULE 1: BLOGS
+-- 6. MODULE 1: BLOGS
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.blogs (
@@ -225,7 +334,7 @@ CREATE TRIGGER tr_blogs_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 6. MODULE 2: CLIENT REVIEWS (TEXT)
+-- 7. MODULE 2: CLIENT REVIEWS (TEXT)
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.reviews (
@@ -253,7 +362,7 @@ CREATE TRIGGER tr_reviews_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 7. MODULE 3: VIDEO REVIEWS
+-- 8. MODULE 3: VIDEO REVIEWS
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.video_reviews (
@@ -279,7 +388,7 @@ CREATE TRIGGER tr_video_reviews_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 8. MODULE 4: OUR WORKS (PORTFOLIO)
+-- 9. MODULE 4: OUR WORKS (PORTFOLIO)
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.works (
@@ -314,7 +423,7 @@ CREATE TRIGGER tr_works_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 9. MODULE 5: SERVICES (STRICT ZERO-PRICING)
+-- 10. MODULE 5: SERVICES (STRICT ZERO-PRICING)
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.services (
@@ -356,7 +465,7 @@ CREATE TRIGGER tr_services_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 10. MODULE 6: OUR PROCESS
+-- 11. MODULE 6: OUR PROCESS
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.process_steps (
@@ -380,7 +489,7 @@ CREATE TRIGGER tr_process_steps_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 11. MODULE 7: FAQS
+-- 12. MODULE 7: FAQS
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.faqs (
@@ -403,7 +512,7 @@ CREATE TRIGGER tr_faqs_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 12. MODULE 8: SITE NUMBERS / STATISTICS
+-- 13. MODULE 8: SITE NUMBERS / STATISTICS
 -- ----------------------------------------------------------------------------
 
 CREATE TABLE IF NOT EXISTS public.site_numbers (
@@ -428,7 +537,7 @@ CREATE TRIGGER tr_site_numbers_updated_at
   FOR EACH ROW EXECUTE FUNCTION public.handle_updated_at();
 
 -- ----------------------------------------------------------------------------
--- 13. DASHBOARD & SIDEBAR AGGREGATE FUNCTION
+-- 14. DASHBOARD & SIDEBAR AGGREGATE FUNCTION
 -- ----------------------------------------------------------------------------
 
 CREATE OR REPLACE FUNCTION public.get_admin_dashboard_counts()
@@ -468,7 +577,7 @@ REVOKE ALL ON FUNCTION public.get_admin_dashboard_counts() FROM PUBLIC, anon;
 GRANT EXECUTE ON FUNCTION public.get_admin_dashboard_counts() TO authenticated;
 
 -- ============================================================================
--- 14. ROW LEVEL SECURITY (RLS) POLICIES
+-- 15. ROW LEVEL SECURITY (RLS) POLICIES
 -- ============================================================================
 
 ALTER TABLE public.admin_users ENABLE ROW LEVEL SECURITY;
@@ -493,19 +602,7 @@ CREATE POLICY "Admins can view admin list"
   TO authenticated
   USING (public.is_admin() OR auth.uid() = id);
 
--- Secure bootstrap: first user to sign up when admin_users is empty can claim owner
-DROP POLICY IF EXISTS "Bootstrap initial owner" ON public.admin_users;
-CREATE POLICY "Bootstrap initial owner"
-  ON public.admin_users
-  FOR INSERT
-  TO authenticated
-  WITH CHECK (
-    (SELECT COUNT(*) FROM public.admin_users) = 0
-    AND id = auth.uid()
-    AND role = 'owner'
-  );
-
--- Owner management: only owners can insert new admin accounts
+-- Owner management: only authenticated owners can insert new admin accounts
 DROP POLICY IF EXISTS "Owners can add admin users" ON public.admin_users;
 CREATE POLICY "Owners can add admin users"
   ON public.admin_users
@@ -513,7 +610,7 @@ CREATE POLICY "Owners can add admin users"
   TO authenticated
   WITH CHECK (public.is_owner());
 
--- Profile updates: owners can update any profile; users can update their own
+-- Profile updates: owners can update any profile; users can update their own permitted fields
 DROP POLICY IF EXISTS "Owners and self can update profile" ON public.admin_users;
 CREATE POLICY "Owners and self can update profile"
   ON public.admin_users
@@ -579,7 +676,7 @@ CREATE POLICY "Admins can insert activity logs"
   TO authenticated
   WITH CHECK (public.is_admin());
 
--- No UPDATE or DELETE policies: logs are completely immutable
+-- Explicitly no UPDATE or DELETE policies exist for admin_activity_logs
 
 -- ----------------------------------------------------------------------------
 -- Policies: blogs
@@ -724,3 +821,52 @@ CREATE POLICY "Admins have full access to site numbers"
   TO authenticated
   USING (public.is_admin())
   WITH CHECK (public.is_admin());
+
+-- ============================================================================
+-- 16. TABLE-LEVEL PERMISSION HARDENING (GRANT & REVOKE)
+-- ============================================================================
+
+-- Administrative tables: revoke public/anon access entirely
+REVOKE ALL ON TABLE public.admin_users FROM PUBLIC, anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.admin_users TO authenticated;
+
+REVOKE ALL ON TABLE public.admin_settings FROM PUBLIC, anon;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.admin_settings TO authenticated;
+
+-- Activity logs: strictly revoke UPDATE, DELETE, TRUNCATE from ALL roles
+REVOKE ALL ON TABLE public.admin_activity_logs FROM PUBLIC, anon;
+REVOKE UPDATE, DELETE, TRUNCATE ON TABLE public.admin_activity_logs FROM authenticated;
+GRANT SELECT, INSERT ON TABLE public.admin_activity_logs TO authenticated;
+
+-- Public content tables: grant read to public/anon; write only to authenticated (governed by RLS)
+GRANT SELECT ON TABLE public.blogs TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.blogs TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.blogs FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.reviews TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.reviews TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.reviews FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.video_reviews TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.video_reviews TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.video_reviews FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.works TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.works TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.works FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.services TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.services TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.services FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.process_steps TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.process_steps TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.process_steps FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.faqs TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.faqs TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.faqs FROM anon, PUBLIC;
+
+GRANT SELECT ON TABLE public.site_numbers TO anon, authenticated;
+GRANT INSERT, UPDATE, DELETE ON TABLE public.site_numbers TO authenticated;
+REVOKE INSERT, UPDATE, DELETE, TRUNCATE ON TABLE public.site_numbers FROM anon, PUBLIC;
