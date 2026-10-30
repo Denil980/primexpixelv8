@@ -117,8 +117,9 @@ DECLARE
 BEGIN
   IF (TG_OP = 'DELETE' AND OLD.role = 'owner') OR 
      (TG_OP = 'UPDATE' AND OLD.role = 'owner' AND NEW.role <> 'owner') THEN
-    -- Serialize concurrent owner changes using row-level locking
-    PERFORM 1 FROM public.admin_users WHERE role = 'owner' FOR UPDATE;
+    -- Serialize all owner demotion/deletion transactions using an exclusive transaction-scoped advisory lock.
+    -- This guarantees zero race conditions where two concurrent requests could leave 0 owners.
+    PERFORM pg_advisory_xact_lock(847291049281749201);
     
     SELECT COUNT(*) INTO owner_count FROM public.admin_users WHERE role = 'owner';
     
@@ -145,58 +146,65 @@ CREATE TRIGGER tr_protect_last_owner
 -- ----------------------------------------------------------------------------
 
 -- Controlled, one-time server-side procedure to provision the initial owner.
--- Permanently disables itself once an owner exists.
-CREATE OR REPLACE FUNCTION public.provision_initial_owner(owner_full_name TEXT DEFAULT 'PrimeXPixel Owner')
+-- Access is strictly revoked from PUBLIC, anon, and authenticated application roles.
+-- It can ONLY be executed by a trusted database operator in the Supabase SQL Editor
+-- or via service-role credentials.
+CREATE OR REPLACE FUNCTION public.provision_initial_owner(
+  target_user_id UUID,
+  target_email TEXT,
+  owner_full_name TEXT DEFAULT 'PrimeXPixel Owner'
+)
 RETURNS JSONB AS $$
 DECLARE
-  current_user_id UUID;
-  current_user_email TEXT;
+  verified_auth_email TEXT;
   existing_count INTEGER;
   new_admin public.admin_users;
 BEGIN
-  current_user_id := auth.uid();
-  IF current_user_id IS NULL THEN
-    RAISE EXCEPTION 'Authentication required: User must be signed in to invoke owner provisioning.';
-  END IF;
-
-  SELECT email INTO current_user_email FROM auth.users WHERE id = current_user_id;
-  IF current_user_email IS NULL THEN
-    RAISE EXCEPTION 'User email not found in verified authentication records.';
-  END IF;
-
-  -- Atomic check: ensure no admin or owner currently exists
+  -- 1. Check if an administrator or owner already exists (one-time execution guarantee)
   SELECT COUNT(*) INTO existing_count FROM public.admin_users;
   IF existing_count > 0 THEN
     RAISE EXCEPTION 'Bootstrap unavailable: An initial owner has already been provisioned for this system.';
   END IF;
 
+  -- 2. Verify target identity against Supabase auth.users records
+  SELECT email INTO verified_auth_email FROM auth.users WHERE id = target_user_id;
+  IF verified_auth_email IS NULL THEN
+    RAISE EXCEPTION 'User UID % not found in auth.users authentication records.', target_user_id;
+  END IF;
+
+  IF LOWER(verified_auth_email) <> LOWER(target_email) THEN
+    RAISE EXCEPTION 'Provided email does not match verified auth.users record (expected %)', verified_auth_email;
+  END IF;
+
+  -- 3. Insert initial owner record
   INSERT INTO public.admin_users (id, email, full_name, role, theme_preference)
-  VALUES (current_user_id, current_user_email, owner_full_name, 'owner', 'system')
+  VALUES (target_user_id, verified_auth_email, owner_full_name, 'owner', 'system')
   RETURNING * INTO new_admin;
 
-  -- Record audit log of the bootstrap event
+  -- 4. Record tamper-proof audit log entry
   INSERT INTO public.admin_activity_logs (admin_id, admin_email, action, module, record_id, record_title, metadata)
   VALUES (
-    current_user_id,
-    current_user_email,
+    target_user_id,
+    verified_auth_email,
     'bootstrap_owner',
     'auth',
-    current_user_id::text,
-    current_user_email,
-    jsonb_build_object('event', 'Initial owner account successfully provisioned')
+    target_user_id::text,
+    verified_auth_email,
+    jsonb_build_object('event', 'Initial owner account successfully provisioned via trusted operator procedure')
   );
 
   RETURN jsonb_build_object(
     'success', true,
     'message', 'Initial owner provisioned successfully',
-    'email', current_user_email,
+    'email', verified_auth_email,
     'role', 'owner'
   );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = public, pg_temp;
 
-REVOKE ALL ON FUNCTION public.provision_initial_owner(TEXT) FROM PUBLIC, anon;
-GRANT EXECUTE ON FUNCTION public.provision_initial_owner(TEXT) TO authenticated;
+-- Revoke execution from ALL client-facing roles (prevents browser/REST execution)
+REVOKE ALL ON FUNCTION public.provision_initial_owner(UUID, TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.provision_initial_owner(UUID, TEXT, TEXT) TO service_role;
 
 -- ----------------------------------------------------------------------------
 -- 4. SYSTEM & ADMIN SETTINGS
